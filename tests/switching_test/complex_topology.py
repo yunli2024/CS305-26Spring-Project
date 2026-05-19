@@ -67,6 +67,12 @@ def run_mininet():
     do_arp_all(net)
     time.sleep(2)
 
+    print("\n===== Warm up controller flows =====")
+    net.pingAll()
+    time.sleep(1)
+    do_arp_all(net)
+    time.sleep(1)
+
     print("\n===== Initial complex topology pingAll =====")
     initial_loss = net.pingAll()
 
