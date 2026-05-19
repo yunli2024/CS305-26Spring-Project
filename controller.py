@@ -33,6 +33,7 @@ class ControllerApp(app_manager.OSKenApp):
         self.ip_to_mac = {}
         self.links = defaultdict(set)
         self.link_ports = {}
+        self.forward_macs = set()
         self.firewall = Firewall()
 
     @set_ev_cls(event.EventSwitchEnter)
@@ -108,6 +109,17 @@ class ControllerApp(app_manager.OSKenApp):
         Event handler for when any switch port changes state.
         This includes links for hosts as well as links between switches.
         """
+        port = ev.port
+        if port.is_down():
+            for key in list(self.link_ports):
+                if key[0] == port.dpid and self.link_ports[key] == port.port_no:
+                    self.links[key[0]].discard(key[1])
+                    self.link_ports.pop(key, None)
+            for mac, host in list(self.hosts.items()):
+                if host["dpid"] == port.dpid and host["port"] == port.port_no:
+                    self.hosts.pop(mac, None)
+                    if host["ip"]:
+                        self.ip_to_mac.pop(host["ip"], None)
         self._refresh_forwarding_rules()
 
 
@@ -201,6 +213,7 @@ class ControllerApp(app_manager.OSKenApp):
         return None
 
     def _refresh_forwarding_rules(self):
+        self._clear_forwarding_rules()
         for dst_mac, dst_host in self.hosts.items():
             dst_dpid = dst_host["dpid"]
             dst_port = dst_host["port"]
@@ -220,6 +233,23 @@ class ControllerApp(app_manager.OSKenApp):
                 self._install_forwarding_rule(datapath, dst_mac, out_port)
 
             self._log_host_paths(dst_mac)
+        self.forward_macs = set(self.hosts)
+
+    def _clear_forwarding_rules(self):
+        for dst_mac in self.forward_macs | set(self.hosts):
+            for datapath in self.datapaths.values():
+                self._delete_forwarding_rule(datapath, dst_mac)
+
+    def _delete_forwarding_rule(self, datapath, dst_mac):
+        ofctl = self.ofctls.get(datapath.id)
+        if ofctl is None:
+            return
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+        wildcards = ofproto.OFPFW_ALL & ~ofproto.OFPFW_DL_DST
+        match = parser.OFPMatch(wildcards, 0, 0, dst_mac, 0, 0, 0,
+                                0, 0, 0, 0, 0, 0)
+        ofctl.delete_flow(cookie=0, priority=100, match=match)
 
     def _install_forwarding_rule(self, datapath, dst_mac, out_port):
         ofctl = self.ofctls.get(datapath.id)
