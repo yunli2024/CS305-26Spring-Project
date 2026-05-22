@@ -45,6 +45,7 @@ class ControllerApp(app_manager.OSKenApp):
         self.datapaths[datapath.id] = datapath
         self.ofctls[datapath.id] = OfCtl.factory(datapath, self.logger)
         self._install_controller_flows(datapath)
+        self.firewall.install_rules(self.ofctls)
         self._refresh_forwarding_rules()
 
     @set_ev_cls(event.EventSwitchLeave)
