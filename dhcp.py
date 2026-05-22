@@ -65,11 +65,11 @@ class DHCPServer():
     @classmethod
     def _reclaim_expired(cls):
         expired_macs = []
-            for mac, ip in cls.ip_pool.items():
-                if cls._is_expired(ip):
+        for mac, ip in cls.ip_pool.items():
+            if cls._is_expired(ip):
                     expired_macs.append(mac)
         for mac in expired_macs:
-            ip = cls.ip_pool.pop(mac) 删除mac对应的ip 返回ip
+            ip = cls.ip_pool.pop(mac)  #删除mac对应的ip 返回ip
             cls.lease_expiry.pop(ip, None) #ip不存在返回none
 
     #统计并返回已经被占用了的 IP 地址
