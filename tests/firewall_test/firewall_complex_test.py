@@ -42,6 +42,45 @@ def ping_result(src, dst_ip, count=3):
     return received, output
 
 
+def wait_for_ping(src, dst_ip, timeout=20):
+    deadline = time.time() + timeout
+    last_output = ""
+    while time.time() < deadline:
+        received, output = ping_result(src, dst_ip, count=1)
+        last_output = output
+        if received > 0:
+            return True, output
+        time.sleep(1)
+    return False, last_output
+
+
+def wait_for_curl(host, url, timeout=20):
+    deadline = time.time() + timeout
+    last_output = ""
+    while time.time() < deadline:
+        output = curl(host, url)
+        last_output = output
+        if "HTTP_CODE=200" in output and "EXIT=0" in output:
+            return True, output
+        time.sleep(1)
+    return False, last_output
+
+
+def warm_up_network(net):
+    print("\n===== Warm up controller discovery and forwarding flows =====")
+    for _ in range(5):
+        do_arp_all(net)
+        time.sleep(1)
+
+    # The controller only sends ARP packets to PacketIn. A short pingAll round
+    # gives host discovery, ARP replies, and forwarding rule refreshes time to
+    # settle before the firewall assertions below.
+    net.pingAll()
+    time.sleep(2)
+    do_arp_all(net)
+    time.sleep(2)
+
+
 def print_case(name, passed, output):
     status = "PASS" if passed else "FAIL"
     print("\n[%s] %s" % (status, name))
@@ -110,9 +149,7 @@ def run_mininet():
     net.start()
     time.sleep(2)
 
-    for _ in range(3):
-        do_arp_all(net)
-        time.sleep(1)
+    warm_up_network(net)
 
     h1 = net.get("h1")
     h2 = net.get("h2")
@@ -130,23 +167,23 @@ def run_mininet():
     received, output = ping_result(h1, "192.168.117.3")
     tests.append(("h1 -> h2 ICMP is blocked across multi-hop paths", received == 0, output))
 
-    received, output = ping_result(h1, "192.168.117.4")
-    tests.append(("h1 -> h3 ICMP is allowed", received > 0, output))
+    passed, output = wait_for_ping(h1, "192.168.117.4")
+    tests.append(("h1 -> h3 ICMP is allowed", passed, output))
 
-    received, output = ping_result(h4, "192.168.117.3")
-    tests.append(("h4 -> h2 ICMP is allowed because source IP is different", received > 0, output))
+    passed, output = wait_for_ping(h4, "192.168.117.3")
+    tests.append(("h4 -> h2 ICMP is allowed because source IP is different", passed, output))
 
-    received, output = ping_result(h2, "192.168.117.2")
-    tests.append(("h2 -> h1 reverse ICMP is allowed because rule is directional", received > 0, output))
+    passed, output = wait_for_ping(h2, "192.168.117.2")
+    tests.append(("h2 -> h1 reverse ICMP is allowed because rule is directional", passed, output))
 
-    received, output = ping_result(h5, "192.168.117.4")
-    tests.append(("unrelated h5 -> h3 ICMP remains reachable", received > 0, output))
+    passed, output = wait_for_ping(h5, "192.168.117.4")
+    tests.append(("unrelated h5 -> h3 ICMP remains reachable", passed, output))
 
     output = curl(h1, "http://192.168.117.3:80/")
     tests.append(("h1 -> h2 TCP/80 is blocked", "HTTP_CODE=000" in output or "EXIT=28" in output, output))
 
-    output = curl(h1, "http://192.168.117.3:8080/")
-    tests.append(("h1 -> h2 TCP/8080 is allowed", "HTTP_CODE=200" in output and "EXIT=0" in output, output))
+    passed, output = wait_for_curl(h1, "http://192.168.117.3:8080/")
+    tests.append(("h1 -> h2 TCP/8080 is allowed", passed, output))
 
     print("\n===== Complex firewall test results =====")
     for name, passed, output in tests:
