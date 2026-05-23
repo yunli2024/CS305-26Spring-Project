@@ -20,6 +20,7 @@ import logging
 import copy
 import heapq
 from firewall import Firewall
+from dns_server import DNSServer
 
 
 class ControllerApp(app_manager.OSKenApp):
@@ -35,6 +36,7 @@ class ControllerApp(app_manager.OSKenApp):
         self.link_ports = {}
         self.forward_macs = set()
         self.firewall = Firewall()
+        self.dns_server = DNSServer()
 
     @set_ev_cls(event.EventSwitchEnter)
     def handle_switch_add(self, ev):
@@ -45,6 +47,8 @@ class ControllerApp(app_manager.OSKenApp):
         self.datapaths[datapath.id] = datapath
         self.ofctls[datapath.id] = OfCtl.factory(datapath, self.logger)
         self._install_controller_flows(datapath)
+        self.dns_server.install_packetin_flow(datapath, self.ofctls[datapath.id],
+                                              ether_types, inet, VLANID_NONE)
         self.firewall.install_rules(self.ofctls)
         self._refresh_forwarding_rules()
 
@@ -153,11 +157,29 @@ class ControllerApp(app_manager.OSKenApp):
         pkt_arp = pkt.get_protocol(arp.arp)
         if pkt_arp:
             self._handle_arp(datapath, in_port, pkt_arp)
+            return
+        if self.dns_server.handle_dns(datapath, in_port, pkt):
+            return
 
     def _handle_arp(self, datapath, in_port, pkt_arp):
         self._learn_host(pkt_arp.src_mac, pkt_arp.src_ip, datapath.id, in_port)
 
         if pkt_arp.opcode != arp.ARP_REQUEST:
+            self._refresh_forwarding_rules()
+            return
+
+        if self.dns_server.is_dns_ip(pkt_arp.dst_ip):
+            ofctl = self.ofctls.get(datapath.id)
+            if ofctl is None:
+                return
+            ofctl.send_arp(arp.ARP_REPLY, VLANID_NONE,
+                           pkt_arp.src_mac,
+                           self.dns_server.server_mac,
+                           pkt_arp.dst_ip,
+                           pkt_arp.src_ip,
+                           pkt_arp.src_mac,
+                           datapath.ofproto.OFPP_CONTROLLER,
+                           in_port)
             self._refresh_forwarding_rules()
             return
 
