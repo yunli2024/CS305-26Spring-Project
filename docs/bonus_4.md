@@ -443,6 +443,15 @@ sudo env "PATH=$PATH" python tests/dns_test/test_network.py
 ===== Summary: 4/4 checks passed =====
 ```
 
+每个 DNS case 的详细输出中还应包含：
+
+```text
+DNS_TEST_PASS
+EXIT=0
+```
+
+如果出现 `SyntaxError`，或者只有源码回显中的 `DNS_TEST_PASS`，但没有 `EXIT=0`，说明 DNS 查询子脚本没有真正执行成功，不能算通过。
+
 还应看到 DNS flow：
 
 ```text

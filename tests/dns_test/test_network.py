@@ -5,6 +5,8 @@ from mininet.net import Mininet
 from mininet.node import RemoteController
 from mininet.topo import Topo
 
+from dns_query_command import build_python_script_command
+
 
 def disable_ipv6(node):
     node.cmd("sysctl -w net.ipv6.conf.all.disable_ipv6=1")
@@ -74,11 +76,8 @@ class DNSTopo(Topo):
 
 
 def run_dns_query(host, name, expected):
-    command = "python3 -c %s %s %s" % (
-        repr(DNS_QUERY_SCRIPT),
-        name,
-        expected,
-    )
+    command = build_python_script_command(DNS_QUERY_SCRIPT, [name, expected])
+    command = "%s; echo EXIT=$?" % command
     return host.cmd(command)
 
 
@@ -108,13 +107,13 @@ def run_mininet():
     tests = []
 
     output = run_dns_query(h1, "web.cs305.local", "192.168.1.3")
-    tests.append(("web.cs305.local resolves to 192.168.1.3", "DNS_TEST_PASS" in output, output))
+    tests.append(("web.cs305.local resolves to 192.168.1.3", "DNS_TEST_PASS" in output and "EXIT=0" in output, output))
 
     output = run_dns_query(h1, "h1.cs305.local", "192.168.1.2")
-    tests.append(("h1.cs305.local resolves to 192.168.1.2", "DNS_TEST_PASS" in output, output))
+    tests.append(("h1.cs305.local resolves to 192.168.1.2", "DNS_TEST_PASS" in output and "EXIT=0" in output, output))
 
     output = run_dns_query(h1, "missing.cs305.local", "NXDOMAIN")
-    tests.append(("missing.cs305.local returns NXDOMAIN", "DNS_TEST_PASS" in output, output))
+    tests.append(("missing.cs305.local returns NXDOMAIN", "DNS_TEST_PASS" in output and "EXIT=0" in output, output))
 
     loss = net.pingAll()
     tests.append(("normal shortest-path forwarding still works", loss == 0, "packet loss=%s%%" % loss))
