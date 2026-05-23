@@ -103,7 +103,7 @@ class ComplexFirewallTopo(Topo):
 
     h1 and h2 are separated by several redundant paths. The current
     firewall_rule.json should still block only h1 -> h2 ICMP and h1 -> h2
-    TCP/80, while other hosts, reverse traffic, and TCP/8080 stay reachable.
+    TCP/80, while other hosts, reverse TCP traffic, and TCP/8080 stay reachable.
     """
 
     def __init__(self, **opts):
@@ -157,7 +157,9 @@ def run_mininet():
     h4 = net.get("h4")
     h5 = net.get("h5")
 
+    h1.cmd('pkill -f "python3 -m http.server" || true')
     h2.cmd('pkill -f "python3 -m http.server" || true')
+    h1.cmd("python3 -m http.server 8081 --bind 192.168.117.2 >/tmp/h1-http8081.log 2>&1 &")
     h2.cmd("python3 -m http.server 80 --bind 192.168.117.3 >/tmp/h2-http80.log 2>&1 &")
     h2.cmd("python3 -m http.server 8080 --bind 192.168.117.3 >/tmp/h2-http8080.log 2>&1 &")
     time.sleep(1)
@@ -173,8 +175,8 @@ def run_mininet():
     passed, output = wait_for_ping(h4, "192.168.117.3")
     tests.append(("h4 -> h2 ICMP is allowed because source IP is different", passed, output))
 
-    passed, output = wait_for_ping(h2, "192.168.117.2")
-    tests.append(("h2 -> h1 reverse ICMP is allowed because rule is directional", passed, output))
+    passed, output = wait_for_curl(h2, "http://192.168.117.2:8081/")
+    tests.append(("h2 -> h1 reverse TCP/8081 is allowed because rule is directional", passed, output))
 
     passed, output = wait_for_ping(h5, "192.168.117.4")
     tests.append(("unrelated h5 -> h3 ICMP remains reachable", passed, output))
@@ -200,6 +202,7 @@ def run_mininet():
     if os.environ.get("MININET_CLI") == "1":
         CLI(net)
 
+    h1.cmd('pkill -f "python3 -m http.server" || true')
     h2.cmd('pkill -f "python3 -m http.server" || true')
     net.stop()
 
