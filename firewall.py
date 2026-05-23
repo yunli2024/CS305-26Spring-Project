@@ -66,7 +66,7 @@ class Firewall:
         """
         rules = []
 
-        # TODO: read rule_file
+        # read rule_file
         if not os.path.exists(rule_file):
             return rules
         with open(rule_file,"r") as f:
@@ -115,7 +115,7 @@ class Firewall:
                     dst_port=self._normalize_port(rule.dst_port)
                 except(ValueError,TypeError):
                     continue # 跳过不合法端口号
-                # TODO: skip invalid port rules 什么是invalid?? 超范围
+                #  skip invalid port rules 认为超过范围的不合法
                 if src_port<0 or src_port>65535:
                     continue
                 if dst_port<0 or dst_port>65535:
@@ -130,11 +130,11 @@ class Firewall:
                 ofctl.set_flow(
                     cookie=self.COOKIE,
                     priority=self.PRIORITY,
-                    dl_type=ether.ETH_TYPE_IP, #?
+                    dl_type=ether.ETH_TYPE_IP,
                     nw_src=src_ip,
                     nw_dst=dst_ip,
                     nw_proto=proto_number,
-                    tp_src=src_port, #?
+                    tp_src=src_port, 
                     tp_dst=dst_port,
                     actions=[] # 空列表就表示firewall drop
                 )
