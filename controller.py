@@ -47,6 +47,7 @@ class ControllerApp(app_manager.OSKenApp):
         self.datapaths[datapath.id] = datapath
         self.ofctls[datapath.id] = OfCtl.factory(datapath, self.logger)
         self._install_controller_flows(datapath)
+        # 将DNS的flow 安装到交换机上，使得会将DNS query交给controller
         self.dns_server.install_packetin_flow(datapath, self.ofctls[datapath.id],
                                               ether_types, inet, VLANID_NONE)
         self.firewall.install_rules(self.ofctls)
@@ -168,6 +169,7 @@ class ControllerApp(app_manager.OSKenApp):
             self._refresh_forwarding_rules()
             return
 
+        # 如果arp的目标ip是dns_ip 就reply
         if self.dns_server.is_dns_ip(pkt_arp.dst_ip):
             ofctl = self.ofctls.get(datapath.id)
             if ofctl is None:
