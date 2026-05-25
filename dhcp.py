@@ -12,20 +12,20 @@ from os_ken.lib.packet import dhcp
 
 
 # ──────────────────────────────────────────────
-# 配置项
+# 1.配置项
 # ──────────────────────────────────────────────
 class Config:
     controller_macAddr = '7e:49:b3:f0:f9:99'   # SDN 控制器的虚拟 MAC
     dns          = '8.8.8.8'
     start_ip     = '192.168.1.2'
-    end_ip       = '192.168.1.100'
+    end_ip       = '192.168.1.100'  # 测试时设置较小范围，方便验证地址耗尽
     netmask      = '255.255.255.0'
-    lease_time   = 86400          # 租期：1 天（秒）
+    lease_time   = 86400       # 租期：1 天（秒）
     offer_timeout = 10            # OFFER 待确认超时（秒），RFC 建议值
 
 
 # ──────────────────────────────────────────────
-# DHCP 服务器主类
+# 2.DHCP 服务器主类
 # ──────────────────────────────────────────────
 class DHCPServer:
     """
@@ -41,7 +41,7 @@ class DHCPServer:
           客户端 DECLINE 过的地址，永不再分配（RFC 2131 §3.1.5）
     """
 
-    # 类级别状态 
+    #2.1 类级别状态 
     hardware_addr = Config.controller_macAddr
     start_ip      = Config.start_ip
     end_ip        = Config.end_ip
@@ -65,9 +65,26 @@ class DHCPServer:
     # 服务器标识符（Option 54）等于网关 IP，方便客户端识别
     server_identifier = _gateway_ip
 
+    '''
+    ══════════════════════════════════════════
+    # 2.2工具方法
+    _build_ip_range: 返回地址池范围内所有可用 IP 的有序列表。
+    _is_expired: 判断某个 IP 对应的租约是否已超时。
+    _reclaim_expired: 回收已过期的正式租约以及超时未确认的offer
+    _in_use_ips: 返回当前所有被占用的 IP 集合（包含正式租约与意向预留）。
+    _allocate_ip: 自动回收过期资源并执行原子性分配，为客户端安全地获取或预留一个可用 IP。
+    reset: 重置所有状态（测试用），确保测试之间相互独立
     # ══════════════════════════════════════════
-    # 工具方法
-    # ══════════════════════════════════════════
+    '''
+
+    @classmethod
+    def reset(cls):
+        """重置所有状态（测试用），确保测试之间相互独立"""
+        cls.pending_offers.clear()
+        cls.ip_pool.clear()
+        cls.lease_expiry.clear()
+        cls.bad_ips.clear()
+        print("[RESET] DHCP server state cleared")
 
     @classmethod
     def _build_ip_range(cls) -> list:
@@ -162,9 +179,15 @@ class DHCPServer:
 
         return None  # 地址池耗尽
 
+    '''
     # ══════════════════════════════════════════
-    # 解析 DHCP 选项
+    # 2.3解析 DHCP 选项
+    _get_option: 从 DHCP 报文的选项列表中提取指定 tag 的原始字节值。
+    _get_msg_type: 提取 Option 53 选项，获取 DHCP 消息类型。
+    _get_requested_ip: 提取 Option 50 选项，获取客户端请求的 IP 地址。
+    _get_server_id: 提取 Option 54 选项，获取 DHCP 服务器的标识符（IP地址）。
     # ══════════════════════════════════════════
+    '''
 
     @staticmethod
     def _get_option(dhcp_pkt, tag: int):
@@ -192,9 +215,14 @@ class DHCPServer:
         val = cls._get_option(dhcp_pkt, dhcp.DHCP_SERVER_IDENTIFIER_OPT)
         return addrconv.ipv4.bin_to_text(val) if val else None
 
+    '''
     # ══════════════════════════════════════════
-    # 构建回复报文
+    # 2.4构建回复报文
+    _build_options: 构建并返回 DHCP 回复所需的标准选项列表（包含消息类型、掩码、网关、DNS、租期和服务器标识）。
+    _build_reply_pkt: 封装并生成完整的带有以太网、IPv4 和 UDP 层的 DHCP 回复报文（用于 OFFER 或 ACK），支持根据场景选择单播或广播发送。
+    _build_nak_pkt: 封装并生成符合 RFC 2131 规范的 DHCPNAK 报文，将分配地址置为 0.0.0.0 并强制以广播形式发送，用于拒绝客户端的请求。
     # ══════════════════════════════════════════
+    '''
 
     @classmethod
     def _build_options(cls, msg_type: int) -> dhcp.options:
@@ -277,7 +305,7 @@ class DHCPServer:
         options = dhcp.options(option_list=[
             dhcp.option(
                 tag=dhcp.DHCP_MESSAGE_TYPE_OPT,
-                value=bytes([dhcp.DHCP_NAK]),
+                value=bytes([6]),  # DHCPNAK = 6
             ),
             dhcp.option(
                 tag=dhcp.DHCP_SERVER_IDENTIFIER_OPT,
@@ -302,9 +330,15 @@ class DHCPServer:
         pkt.add_protocol(dhcp_pkt)
         return pkt
 
+    '''
     # ══════════════════════════════════════════
-    # RFC 2131 状态处理
+    # 2.5 RFC 2131 状态处理
+    _handle_discover: 处理客户端广播的 DISCOVER 报文，为其预留 IP 并返回相应的 OFFER 回复报文。
+    _handle_request: 处理 REQUEST 报文，自动识别并处理 SELECTING（选择确认）、INIT-REBOOT（重启恢复）、RENEWING（续租单播）和 REBINDING（续租广播）四种不同状态下的续租与确认逻辑。
+    _handle_release: 处理客户端主动发送的 RELEASE 报文，立即释放对应的 IP 租约并将地址重新放回可用地址池。
+    _handle_decline: 处理客户端发送的 DECLINE 冲突拒绝报文，将冲突的 IP 移出分配列表并加入 bad_ips 黑名单，防止该 IP 被再次分配。
     # ══════════════════════════════════════════
+    '''
 
     @classmethod
     def _handle_discover(cls, pkt) -> Optional[packet.Packet]:
@@ -458,10 +492,8 @@ class DHCPServer:
     @classmethod
     def _handle_decline(cls, pkt):
         """
-        RFC 2131 §3.1.5 — 客户端检测到地址冲突，发送 DHCPDECLINE。
+        RFC 2131 §3.1.5 — 客户端检测到地址冲突，发送 DECLINE。
         将该 IP 加入 bad_ips 黑名单，永不再分配。
-
-        修复：原实现完全缺少此处理，可能导致同一个有冲突的 IP 被反复分配。
         """
         eth_pkt    = pkt.get_protocol(ethernet.ethernet)
         dhcp_pkt   = pkt.get_protocol(dhcp.dhcp)
@@ -485,10 +517,13 @@ class DHCPServer:
             cls.bad_ips.add(declined_ip)
             print(f"[DECLINE] mac={client_mac} 拒绝 ip={declined_ip}，"
                   f"加入 bad_ips 黑名单")
-
+    '''
     # ══════════════════════════════════════════
-    # 内部辅助
+    # 2.6 内部辅助
+    _in_pool: 使用 ipaddress 模块判断指定的 IP 地址是否在合法的地址池范围内。
+    _confirm_lease: 将临时预留（pending offer）正式升级为长期租约，记录到租约状态表并清除预留记录，最后返回相应的 ACK 确认报文。
     # ══════════════════════════════════════════
+    '''
 
     @classmethod
     def _in_pool(cls, ip: str) -> bool:
@@ -520,9 +555,12 @@ class DHCPServer:
             client_mac, xid, ip, dhcp.DHCP_ACK, unicast_ip=unicast_ip
         )
 
+    '''
     # ══════════════════════════════════════════
-    # 主入口
+    # 2.7 主入口
+    handle_dhcp: DHCP 报文分发入口，负责识别报文的消息类型（DISCOVER、REQUEST、RELEASE、DECLINE）
     # ══════════════════════════════════════════
+    '''
 
     @classmethod
     def handle_dhcp(cls, datapath, port, pkt):
@@ -564,28 +602,25 @@ class DHCPServer:
 
         else:
             print(f"[DHCP] 未处理的消息类型 msg_type={msg_type}")
-
+    
+    '''
     # ══════════════════════════════════════════
-    # 发包
+    # 2.8 发包
+    _send_packet: 通过 OpenFlow 的 PacketOut 消息，将构建好的 DHCP 回复报文序列化后从控制器确定的指定端口发送出去。
     # ══════════════════════════════════════════
-
+    '''
+    
     @classmethod
     def _send_packet(cls, datapath, port, pkt):
         """
         通过 OpenFlow PacketOut 将报文从指定端口发出。
-
         广播/单播的选择已在 _build_reply_pkt / _build_nak_pkt 中通过
         dst_mac / dst_ip 决定，本方法只负责 OF 层面的转发动作。
-
-        修复：原实现始终使用 OFPP_FLOOD；现在只需将 pkt 从客户端进入的
-        port 发出即可（SDN 环境下 port 已由控制器确定）。
         """
         ofproto = datapath.ofproto
         parser  = datapath.ofproto_parser
-
         if isinstance(pkt, str):
             pkt = pkt.encode()
-
         pkt.serialize()
         data    = pkt.data
         actions = [parser.OFPActionOutput(port=port)]
