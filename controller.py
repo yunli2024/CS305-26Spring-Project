@@ -5,6 +5,7 @@ from os_ken.controller.handler import set_ev_cls
 from os_ken.topology import event
 from os_ken.topology.switches import Switch, Host, HostState, Port, PortState, PortData, PortDataState, Link, LinkState
 from os_ken.topology.switches import Switches
+from os_ken.topology.api import get_link
 from os_ken.ofproto import ofproto_v1_0, ether, inet
 from os_ken.lib.packet import packet, ethernet, ether_types, arp
 from os_ken.lib.packet import dhcp
@@ -24,6 +25,9 @@ from firewall import Firewall
 
 class ControllerApp(app_manager.OSKenApp):
     OFP_VERSIONS = [ofproto_v1_0.OFP_VERSION]
+    _CONTEXTS = {
+        'switches': Switches,
+    }
 
     def __init__(self, *args, **kwargs):
         super(ControllerApp, self).__init__(*args, **kwargs)
@@ -45,6 +49,9 @@ class ControllerApp(app_manager.OSKenApp):
         self.datapaths[datapath.id] = datapath
         self.ofctls[datapath.id] = OfCtl.factory(datapath, self.logger)
         self._install_controller_flows(datapath)
+        self.firewall.installed = {
+            key for key in self.firewall.installed if key[0] != datapath.id
+        }
         self.firewall.install_rules(self.ofctls)
         self._refresh_forwarding_rules()
 
@@ -56,6 +63,9 @@ class ControllerApp(app_manager.OSKenApp):
         dpid = ev.switch.dp.id
         self.datapaths.pop(dpid, None)
         self.ofctls.pop(dpid, None)
+        self.firewall.installed = {
+            key for key in self.firewall.installed if key[0] != dpid
+        }
         self.links.pop(dpid, None)
         for neighbors in self.links.values():
             neighbors.discard(dpid)
@@ -88,7 +98,9 @@ class ControllerApp(app_manager.OSKenApp):
         src = ev.link.src
         dst = ev.link.dst
         self.links[src.dpid].add(dst.dpid)
+        self.links[dst.dpid].add(src.dpid)
         self.link_ports[(src.dpid, dst.dpid)] = src.port_no
+        self.link_ports[(dst.dpid, src.dpid)] = dst.port_no
         self._refresh_forwarding_rules()
 
     @set_ev_cls(event.EventLinkDelete)
@@ -99,7 +111,9 @@ class ControllerApp(app_manager.OSKenApp):
         src = ev.link.src
         dst = ev.link.dst
         self.links[src.dpid].discard(dst.dpid)
+        self.links[dst.dpid].discard(src.dpid)
         self.link_ports.pop((src.dpid, dst.dpid), None)
+        self.link_ports.pop((dst.dpid, src.dpid), None)
         self._refresh_forwarding_rules()
    
         
@@ -213,7 +227,30 @@ class ControllerApp(app_manager.OSKenApp):
                 queue.append((neighbor, next_path))
         return None
 
+    def _sync_links_from_topology(self):
+        try:
+            discovered_links = get_link(self, None)
+        except Exception as e:
+            self.logger.debug("Unable to sync topology links: %s", e)
+            return
+
+        links = defaultdict(set)
+        link_ports = {}
+        for link in discovered_links:
+            src = link.src
+            dst = link.dst
+            if src.dpid not in self.datapaths or dst.dpid not in self.datapaths:
+                continue
+            links[src.dpid].add(dst.dpid)
+            links[dst.dpid].add(src.dpid)
+            link_ports[(src.dpid, dst.dpid)] = src.port_no
+            link_ports[(dst.dpid, src.dpid)] = dst.port_no
+
+        self.links = links
+        self.link_ports = link_ports
+
     def _refresh_forwarding_rules(self):
+        self._sync_links_from_topology()
         self._clear_forwarding_rules()
         for dst_mac, dst_host in self.hosts.items():
             dst_dpid = dst_host["dpid"]
