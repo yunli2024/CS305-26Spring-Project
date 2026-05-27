@@ -18,9 +18,9 @@ class Config:
     controller_macAddr = '7e:49:b3:f0:f9:99'   # SDN 控制器的虚拟 MAC
     dns          = '192.168.1.1'  # controller-hosted DNS server for bonus 4
     start_ip     = '192.168.1.2'
-    end_ip       = '192.168.1.100'  # 测试时设置较小范围，方便验证地址耗尽
+    end_ip       = '192.168.1.11'  # 10-address pool used by the DHCP bonus tests
     netmask      = '255.255.255.0'
-    lease_time   = 86400       # 租期：1 天（秒）
+    lease_time   = 30          # 租期：30 秒，匹配租约过期/续租测试
     offer_timeout = 10            # OFFER 待确认超时（秒），RFC 建议值
 
 

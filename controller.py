@@ -1,70 +1,61 @@
+from collections import defaultdict, deque
+
 from os_ken.base import app_manager
 from os_ken.controller import ofp_event
-from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
-from os_ken.controller.handler import set_ev_cls
+from os_ken.controller.handler import MAIN_DISPATCHER, set_ev_cls
+from os_ken.lib.packet import arp, dhcp, ethernet, ether_types, packet
+from os_ken.ofproto import inet, ofproto_v1_0
 from os_ken.topology import event
-from os_ken.topology.switches import Switch, Host, HostState, Port, PortState, PortData, PortDataState, Link, LinkState
-from os_ken.topology.switches import Switches
 from os_ken.topology.api import get_link
-from os_ken.ofproto import ofproto_v1_0, ether, inet
-from os_ken.lib.packet import packet, ethernet, ether_types, arp
-from os_ken.lib.packet import dhcp
-from os_ken.lib.packet import ethernet
-from os_ken.lib.packet import ipv4
-from os_ken.lib.packet import packet
-from os_ken.lib.packet import udp
+from os_ken.topology.switches import LLDPPacket, Switches
+
 from dhcp import DHCPServer
-from collections import defaultdict, deque
-import time
-from ofctl_utilis import OfCtl,OfCtl_v1_0,OfCtl_after_v1_2,VLANID_NONE
-import logging
-import copy
-import heapq
-from firewall import Firewall
 from dns_server import DNSServer
+from firewall import Firewall
+from ofctl_utilis import OfCtl, VLANID_NONE
 
 
 class ControllerApp(app_manager.OSKenApp):
     OFP_VERSIONS = [ofproto_v1_0.OFP_VERSION]
-    _CONTEXTS = {
-        'switches': Switches,
-    }
+    _CONTEXTS = {"switches": Switches}
 
     def __init__(self, *args, **kwargs):
         super(ControllerApp, self).__init__(*args, **kwargs)
+        self.switches = kwargs.get("switches")
         self.datapaths = {}
         self.ofctls = {}
         self.hosts = {}
         self.ip_to_mac = {}
         self.links = defaultdict(set)
         self.link_ports = {}
+        self.down_ports = set()
         self.forward_macs = set()
+        self.logged_paths = {}
         self.firewall = Firewall()
         self.dns_server = DNSServer()
 
     @set_ev_cls(event.EventSwitchEnter)
     def handle_switch_add(self, ev):
-        """
-        Event handler indicating a switch has come online.
-        """
         datapath = ev.switch.dp
+        if not self.datapaths:
+            DHCPServer.reset()
+
         self.datapaths[datapath.id] = datapath
         self.ofctls[datapath.id] = OfCtl.factory(datapath, self.logger)
-        self._install_controller_flows(datapath)
-        # Install DNS PacketIn flow so DNS queries are handled by the controller.
-        self.dns_server.install_packetin_flow(datapath, self.ofctls[datapath.id],
-                                              ether_types, inet, VLANID_NONE)
+
+        self.install_controller_flows(datapath)
+        self.dns_server.install_packetin_flow(
+            datapath, self.ofctls[datapath.id], ether_types, inet, VLANID_NONE
+        )
+        self.clear_logged_paths()
         self.firewall.installed = {
             key for key in self.firewall.installed if key[0] != datapath.id
         }
         self.firewall.install_rules(self.ofctls)
-        self._refresh_forwarding_rules()
+        self.refresh_forwarding_rules()
 
     @set_ev_cls(event.EventSwitchLeave)
     def handle_switch_delete(self, ev):
-        """
-        Event handler indicating a switch has been removed
-        """
         dpid = ev.switch.dp.id
         self.datapaths.pop(dpid, None)
         self.ofctls.pop(dpid, None)
@@ -74,129 +65,123 @@ class ControllerApp(app_manager.OSKenApp):
         self.links.pop(dpid, None)
         for neighbors in self.links.values():
             neighbors.discard(dpid)
+        self.down_ports = {key for key in self.down_ports if key[0] != dpid}
         for key in list(self.link_ports):
             if dpid in key:
                 self.link_ports.pop(key, None)
         for mac, host in list(self.hosts.items()):
             if host["dpid"] == dpid:
                 self.hosts.pop(mac, None)
-                self.ip_to_mac.pop(host["ip"], None)
-        self._refresh_forwarding_rules()
-
+                if host["ip"]:
+                    self.ip_to_mac.pop(host["ip"], None)
+        self.clear_logged_paths()
+        self.refresh_forwarding_rules()
 
     @set_ev_cls(event.EventHostAdd)
     def handle_host_add(self, ev):
-        """
-        Event handler indiciating a host has joined the network
-        This handler is automatically triggered when a host sends an ARP response.
-        """ 
         host = ev.host
         ip = host.ipv4[0] if host.ipv4 else None
-        self._learn_host(host.mac, ip, host.port.dpid, host.port.port_no)
-        self._refresh_forwarding_rules()
+        self.learn_host(host.mac, ip, host.port.dpid, host.port.port_no)
+        self.refresh_forwarding_rules()
 
     @set_ev_cls(event.EventLinkAdd)
     def handle_link_add(self, ev):
-        """
-        Event handler indicating a link between two switches has been added
-        """
-        src = ev.link.src
-        dst = ev.link.dst
-        self.links[src.dpid].add(dst.dpid)
-        self.links[dst.dpid].add(src.dpid)
-        self.link_ports[(src.dpid, dst.dpid)] = src.port_no
-        self.link_ports[(dst.dpid, src.dpid)] = dst.port_no
-        self._refresh_forwarding_rules()
+        self.record_link(ev.link.src, ev.link.dst)
+        self.clear_logged_paths()
+        self.refresh_forwarding_rules()
 
     @set_ev_cls(event.EventLinkDelete)
     def handle_link_delete(self, ev):
-        """
-        Event handler indicating when a link between two switches has been deleted
-        """
-        src = ev.link.src
-        dst = ev.link.dst
-        self.links[src.dpid].discard(dst.dpid)
-        self.links[dst.dpid].discard(src.dpid)
-        self.link_ports.pop((src.dpid, dst.dpid), None)
-        self.link_ports.pop((dst.dpid, src.dpid), None)
-        self._refresh_forwarding_rules()
-   
-        
+        # LLDP-based delete events can be transient under Mininet timing.
+        # Real link-down handling is done in handle_port_modify().
+        return
 
     @set_ev_cls(event.EventPortModify)
     def handle_port_modify(self, ev):
-        """
-        Event handler for when any switch port changes state.
-        This includes links for hosts as well as links between switches.
-        """
         port = ev.port
-        if port.is_down():
-            for key in list(self.link_ports):
-                if key[0] == port.dpid and self.link_ports[key] == port.port_no:
-                    self.links[key[0]].discard(key[1])
-                    self.link_ports.pop(key, None)
-            for mac, host in list(self.hosts.items()):
-                if host["dpid"] == port.dpid and host["port"] == port.port_no:
-                    self.hosts.pop(mac, None)
-                    if host["ip"]:
-                        self.ip_to_mac.pop(host["ip"], None)
-        self._refresh_forwarding_rules()
+        if not port.is_down():
+            self.down_ports.discard((port.dpid, port.port_no))
+            self.clear_logged_paths()
+            self.refresh_forwarding_rules()
+            return
 
+        self.down_ports.add((port.dpid, port.port_no))
+        for key in list(self.link_ports):
+            if key[0] == port.dpid and self.link_ports[key] == port.port_no:
+                self.links[key[0]].discard(key[1])
+                self.link_ports.pop(key, None)
 
+        for mac, host in list(self.hosts.items()):
+            if host["dpid"] == port.dpid and host["port"] == port.port_no:
+                self.hosts.pop(mac, None)
+                if host["ip"]:
+                    self.ip_to_mac.pop(host["ip"], None)
+        self.clear_logged_paths()
+        self.refresh_forwarding_rules()
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         try:
             msg = ev.msg
             datapath = msg.datapath
+            in_port = msg.in_port
             pkt = packet.Packet(data=msg.data)
-            pkt_dhcp = pkt.get_protocols(dhcp.dhcp)
-            inPort = msg.in_port
-            if not pkt_dhcp:
-                self._handle_non_dhcp_packet(datapath, inPort, pkt)
-            else:
-                DHCPServer.handle_dhcp(datapath, inPort, pkt)      
-            return 
-        except Exception as e:
-            self.logger.error(e)
 
-    def _install_controller_flows(self, datapath):
+            if pkt.get_protocols(dhcp.dhcp):
+                DHCPServer.handle_dhcp(datapath, in_port, pkt)
+                return
+
+            eth = pkt.get_protocol(ethernet.ethernet)
+            if eth and eth.ethertype == ether_types.ETH_TYPE_LLDP:
+                self.handle_lldp(datapath, in_port, msg.data)
+                return
+
+            pkt_arp = pkt.get_protocol(arp.arp)
+            if pkt_arp:
+                self.handle_arp(datapath, in_port, pkt_arp)
+                return
+
+            if self.dns_server.handle_dns(datapath, in_port, pkt):
+                return
+        except Exception as exc:
+            self.logger.error("packet_in failed: %s", exc)
+
+    def install_controller_flows(self, datapath):
         ofctl = self.ofctls.get(datapath.id)
         if ofctl is None:
             return
-        ofctl.set_packetin_flow(cookie=0, priority=1000,
-                                dl_type=ether_types.ETH_TYPE_ARP,
-                                dl_vlan=VLANID_NONE)
+        ofctl.set_packetin_flow(
+            cookie=0,
+            priority=1000,
+            dl_type=ether_types.ETH_TYPE_ARP,
+            dl_vlan=VLANID_NONE,
+        )
 
-    def _handle_non_dhcp_packet(self, datapath, in_port, pkt):
-        pkt_arp = pkt.get_protocol(arp.arp)
-        if pkt_arp:
-            self._handle_arp(datapath, in_port, pkt_arp)
+    def handle_lldp(self, datapath, in_port, data):
+        try:
+            src_dpid, src_port = LLDPPacket.lldp_parse(data)
+        except LLDPPacket.LLDPUnknownFormat:
             return
-        if self.dns_server.handle_dns(datapath, in_port, pkt):
-            return
+        if src_dpid != datapath.id:
+            self.record_link_values(src_dpid, src_port, datapath.id, in_port)
+            self.refresh_forwarding_rules()
 
-    def _handle_arp(self, datapath, in_port, pkt_arp):
-        self._learn_host(pkt_arp.src_mac, pkt_arp.src_ip, datapath.id, in_port)
+    def handle_arp(self, datapath, in_port, pkt_arp):
+        self.learn_host(pkt_arp.src_mac, pkt_arp.src_ip, datapath.id, in_port)
 
         if pkt_arp.opcode != arp.ARP_REQUEST:
-            self._refresh_forwarding_rules()
+            self.refresh_forwarding_rules()
             return
 
-        # 如果arp的目标ip是dns_ip 就reply
         if self.dns_server.is_dns_ip(pkt_arp.dst_ip):
-            ofctl = self.ofctls.get(datapath.id)
-            if ofctl is None:
-                return
-            ofctl.send_arp(arp.ARP_REPLY, VLANID_NONE,
-                           pkt_arp.src_mac,
-                           self.dns_server.server_mac,
-                           pkt_arp.dst_ip,
-                           pkt_arp.src_ip,
-                           pkt_arp.src_mac,
-                           datapath.ofproto.OFPP_CONTROLLER,
-                           in_port)
-            self._refresh_forwarding_rules()
+            self.send_arp_reply(
+                datapath,
+                in_port,
+                pkt_arp,
+                self.dns_server.server_mac,
+                pkt_arp.dst_ip,
+            )
+            self.refresh_forwarding_rules()
             return
 
         target_mac = self.ip_to_mac.get(pkt_arp.dst_ip)
@@ -205,20 +190,26 @@ class ControllerApp(app_manager.OSKenApp):
                              pkt_arp.dst_ip, pkt_arp.src_ip)
             return
 
+        self.send_arp_reply(datapath, in_port, pkt_arp, target_mac, pkt_arp.dst_ip)
+        self.refresh_forwarding_rules()
+
+    def send_arp_reply(self, datapath, out_port, request, sender_mac, sender_ip):
         ofctl = self.ofctls.get(datapath.id)
         if ofctl is None:
             return
-        ofctl.send_arp(arp.ARP_REPLY, VLANID_NONE,
-                       pkt_arp.src_mac,
-                       target_mac,
-                       pkt_arp.dst_ip,
-                       pkt_arp.src_ip,
-                       pkt_arp.src_mac,
-                       datapath.ofproto.OFPP_CONTROLLER,
-                       in_port)
-        self._refresh_forwarding_rules()
+        ofctl.send_arp(
+            arp.ARP_REPLY,
+            VLANID_NONE,
+            request.src_mac,
+            sender_mac,
+            sender_ip,
+            request.src_ip,
+            request.src_mac,
+            datapath.ofproto.OFPP_CONTROLLER,
+            out_port,
+        )
 
-    def _learn_host(self, mac, ip, dpid, port):
+    def learn_host(self, mac, ip, dpid, port):
         if not mac or mac == "ff:ff:ff:ff:ff:ff":
             return
         if ip == "0.0.0.0":
@@ -231,12 +222,48 @@ class ControllerApp(app_manager.OSKenApp):
         self.hosts[mac] = {"ip": ip, "dpid": dpid, "port": port}
         if ip:
             self.ip_to_mac[ip] = mac
-        self.logger.info("Learned host mac=%s ip=%s at s%s:%s",
-                         mac, ip, dpid, port)
+        if old != self.hosts[mac]:
+            self.clear_logged_paths(mac)
 
-    def _shortest_path(self, src_dpid, dst_dpid):
+    def record_link(self, src, dst):
+        self.record_link_values(src.dpid, src.port_no, dst.dpid, dst.port_no)
+
+    def record_link_values(self, src_dpid, src_port, dst_dpid, dst_port):
+        if src_dpid == dst_dpid:
+            return
+        if (src_dpid, src_port) in self.down_ports:
+            return
+        if (dst_dpid, dst_port) in self.down_ports:
+            return
+        self.links[src_dpid].add(dst_dpid)
+        self.links[dst_dpid].add(src_dpid)
+        self.link_ports[(src_dpid, dst_dpid)] = src_port
+        self.link_ports[(dst_dpid, src_dpid)] = dst_port
+
+    def remove_link(self, src, dst):
+        self.links[src.dpid].discard(dst.dpid)
+        self.links[dst.dpid].discard(src.dpid)
+        self.link_ports.pop((src.dpid, dst.dpid), None)
+        self.link_ports.pop((dst.dpid, src.dpid), None)
+
+    def sync_topology_links(self):
+        if self.switches is not None:
+            for link in list(self.switches.links):
+                self.record_link(link.src, link.dst)
+
+        try:
+            discovered = get_link(self, None)
+        except Exception as exc:
+            self.logger.debug("get_link failed: %s", exc)
+            return
+
+        for link in discovered:
+            self.record_link(link.src, link.dst)
+
+    def shortest_path(self, src_dpid, dst_dpid):
         if src_dpid == dst_dpid:
             return [src_dpid]
+
         queue = deque([(src_dpid, [src_dpid])])
         visited = {src_dpid}
         while queue:
@@ -251,31 +278,10 @@ class ControllerApp(app_manager.OSKenApp):
                 queue.append((neighbor, next_path))
         return None
 
-    def _sync_links_from_topology(self):
-        try:
-            discovered_links = get_link(self, None)
-        except Exception as e:
-            self.logger.debug("Unable to sync topology links: %s", e)
-            return
+    def refresh_forwarding_rules(self):
+        self.sync_topology_links()
+        self.clear_forwarding_rules()
 
-        links = defaultdict(set)
-        link_ports = {}
-        for link in discovered_links:
-            src = link.src
-            dst = link.dst
-            if src.dpid not in self.datapaths or dst.dpid not in self.datapaths:
-                continue
-            links[src.dpid].add(dst.dpid)
-            links[dst.dpid].add(src.dpid)
-            link_ports[(src.dpid, dst.dpid)] = src.port_no
-            link_ports[(dst.dpid, src.dpid)] = dst.port_no
-
-        self.links = links
-        self.link_ports = link_ports
-
-    def _refresh_forwarding_rules(self):
-        self._sync_links_from_topology()
-        self._clear_forwarding_rules()
         for dst_mac, dst_host in self.hosts.items():
             dst_dpid = dst_host["dpid"]
             dst_port = dst_host["port"]
@@ -283,7 +289,7 @@ class ControllerApp(app_manager.OSKenApp):
                 continue
 
             for src_dpid, datapath in self.datapaths.items():
-                path = self._shortest_path(src_dpid, dst_dpid)
+                path = self.shortest_path(src_dpid, dst_dpid)
                 if not path:
                     continue
                 if src_dpid == dst_dpid:
@@ -292,17 +298,18 @@ class ControllerApp(app_manager.OSKenApp):
                     out_port = self.link_ports.get((src_dpid, path[1]))
                     if out_port is None:
                         continue
-                self._install_forwarding_rule(datapath, dst_mac, out_port)
+                self.install_forwarding_rule(datapath, dst_mac, out_port)
 
-            self._log_host_paths(dst_mac)
+            self.log_host_paths(dst_mac)
+
         self.forward_macs = set(self.hosts)
 
-    def _clear_forwarding_rules(self):
+    def clear_forwarding_rules(self):
         for dst_mac in self.forward_macs | set(self.hosts):
             for datapath in self.datapaths.values():
-                self._delete_forwarding_rule(datapath, dst_mac)
+                self.delete_forwarding_rule(datapath, dst_mac)
 
-    def _delete_forwarding_rule(self, datapath, dst_mac):
+    def delete_forwarding_rule(self, datapath, dst_mac):
         ofctl = self.ofctls.get(datapath.id)
         if ofctl is None:
             return
@@ -313,28 +320,48 @@ class ControllerApp(app_manager.OSKenApp):
                                 0, 0, 0, 0, 0, 0)
         ofctl.delete_flow(cookie=0, priority=100, match=match)
 
-    def _install_forwarding_rule(self, datapath, dst_mac, out_port):
+    def install_forwarding_rule(self, datapath, dst_mac, out_port):
         ofctl = self.ofctls.get(datapath.id)
         if ofctl is None:
             return
         actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
-        ofctl.set_flow(cookie=0, priority=100,
-                       dl_dst=dst_mac,
-                       dl_vlan=VLANID_NONE,
-                       actions=actions)
+        ofctl.set_flow(
+            cookie=0,
+            priority=100,
+            dl_dst=dst_mac,
+            dl_vlan=VLANID_NONE,
+            actions=actions,
+        )
 
-    def _log_host_paths(self, dst_mac):
+    def log_host_paths(self, dst_mac):
         dst_host = self.hosts.get(dst_mac)
         if not dst_host:
             return
+
         for src_mac, src_host in sorted(self.hosts.items()):
             if src_mac == dst_mac:
                 continue
-            path = self._shortest_path(src_host["dpid"], dst_host["dpid"])
-            if path:
-                full_path = [src_mac] + ["s%s" % dpid for dpid in path] + [dst_mac]
-                distance = len(full_path) - 1
-                self.logger.info("Shortest path %s -> %s: %s, distance=%s",
-                                 src_mac, dst_mac, " -> ".join(full_path),
-                                 distance)
-    
+            path = self.shortest_path(src_host["dpid"], dst_host["dpid"])
+            if not path:
+                continue
+            signature = tuple(path)
+            key = (src_mac, dst_mac)
+            if self.logged_paths.get(key) == signature:
+                continue
+            self.logged_paths[key] = signature
+            full_path = [src_mac] + ["s%s" % dpid for dpid in path] + [dst_mac]
+            self.logger.info(
+                "Shortest path %s -> %s: %s, distance=%s",
+                src_mac,
+                dst_mac,
+                " -> ".join(full_path),
+                len(full_path) - 1,
+            )
+
+    def clear_logged_paths(self, mac=None):
+        if mac is None:
+            self.logged_paths.clear()
+            return
+        for key in list(self.logged_paths):
+            if mac in key:
+                self.logged_paths.pop(key, None)
