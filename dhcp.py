@@ -16,7 +16,7 @@ from os_ken.lib.packet import dhcp
 # ──────────────────────────────────────────────
 class Config:
     controller_macAddr = '7e:49:b3:f0:f9:99'   # SDN 控制器的虚拟 MAC
-    dns          = '8.8.8.8'
+    dns          = '192.168.1.1'  # controller-hosted DNS server for bonus 4
     start_ip     = '192.168.1.2'
     end_ip       = '192.168.1.100'  # 测试时设置较小范围，方便验证地址耗尽
     netmask      = '255.255.255.0'
