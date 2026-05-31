@@ -9,39 +9,7 @@ from mininet.net import Mininet
 from mininet.node import OVSBridge
 from mininet.topo import Topo
 
-
-"""
-Bonus5: Bufferbloat 实验脚本。
-
-这个脚本不依赖 controller.py，也不需要 os-ken controller。
-它只使用 Mininet 自带的 OVSBridge 和 TCLink 搭建一个二层网络，
-通过改变瓶颈链路的队列大小，观察“大队列会让延迟明显升高”的现象。
-
-实验思路：
-1. h1 -> h3 运行 iperf，制造持续 TCP 大流量。
-2. h2 -> h4 同时运行 ping，模拟小的交互流量。
-3. 两种流量都要经过 s1-s2 这条瓶颈链路。
-4. 对比小队列和大队列时 ping RTT 的变化。
-"""
-
-
 class BufferbloatTopo(Topo):
-    """
-    一个简单的 dumbbell 拓扑。
-
-        h1 ----+
-               |
-               s1 ---- s2 ---- h3
-               |       |
-        h2 ----+       +---- h4
-
-    h1 到 h3：用 iperf 发送 TCP 大流量。
-    h2 到 h4：用 ping 测量延迟。
-
-    两条流都会经过 s1-s2，所以 s1-s2 是共同的瓶颈链路。
-    如果 s1-s2 的队列很大，TCP 包会大量堆积，ping 包也要排队，
-    于是 ping RTT 会明显升高，这就是 Bufferbloat 的核心现象。
-    """
 
     def __init__(self, queue_size, **opts):
         Topo.__init__(self, **opts)
@@ -104,12 +72,8 @@ def parse_iperf(output):
     从 iperf 输出中提取 TCP 吞吐量。
 
     iperf 输出里可能会出现多行 Mbits/sec。
-    最后一行通常是汇总结果，所以这里取最后一个匹配值。
-
+    最后一行是汇总结果，所以这里取最后一个匹配值。
     为了方便比较，函数统一返回 Mbits/sec：
-    - Kbits/sec 会除以 1000；
-    - Gbits/sec 会乘以 1000；
-    - Mbits/sec 直接返回。
     """
     matches = re.findall(r"(\d+(?:\.\d+)?)\s+([KMG]?)bits/sec", output)
     if not matches:
@@ -126,8 +90,7 @@ def parse_iperf(output):
 
 def ping(host, dst_ip, count=8):
     """
-    让某个主机 ping 目标 IP。
-
+    使用命令行让某个主机 ping 目标 IP。
     - count 控制发送多少个 ICMP 包；
     - -i 0.2 表示每 0.2 秒发一个包；
     - -W 2 表示每个包最多等待 2 秒。
@@ -138,19 +101,11 @@ def ping(host, dst_ip, count=8):
 def run_case(queue_size, duration):
     """
     运行一次指定queue_size的实验。
-
-    参数：
-    - queue_size：瓶颈链路 s1-s2 的队列大小。
-    - duration：iperf TCP 大流量持续时间。
-
-    实验流程：
-    1. 启动 Mininet 网络。
-    2. 先在没有 TCP 大流量时测一次 h2 -> h4 的基础 RTT。
-    3. 在 h3 上启动 iperf server。
-    4. h2 -> h4 后台运行 ping。
-    5. h1 -> h3 前台运行 iperf，制造 TCP 大流量。
-    6. 读取 ping 和 iperf 输出，提取 RTT 与吞吐量。
+    queue_size：瓶颈链路 s1-s2 的队列大小。
+    duration：iperf TCP 大流量持续时间。
     """
+
+    # 启动mininet网络，使用指定的size作为瓶颈链路s1-s2的buffer大小
     net = Mininet(
         topo=BufferbloatTopo(queue_size),
         link=TCLink,
@@ -168,41 +123,32 @@ def run_case(queue_size, duration):
         time.sleep(1)
 
         h1, h2, h3, h4 = [net.get(name) for name in ("h1", "h2", "h3", "h4")]
-
         print("\n===== Queue size: %s packets =====" % queue_size)
 
-        # 第一次 ping：网络空闲状态下的延迟。
+        # 第一次 ping：网络空闲状态，没有大流量下，h2 ping h4的RTT。
         # 这个值作为 baseline，说明链路本身的基础 RTT 大概是多少。
         idle_ping = ping(h2, h4.IP())
         idle_loss, idle_rtt = parse_ping(idle_ping)
 
         # 启动 iperf server。
-        # pkill 是为了避免上一次实验留下旧的 iperf server。
-        h3.cmd("pkill -f 'iperf -s' || true")
+        h3.cmd("pkill -f 'iperf -s' || true")  # pkill避免上一次实验留下旧的 iperf server。
         h3.cmd("iperf -s -p 5001 >/tmp/bonus5_iperf_server.log 2>&1 &")
         time.sleep(1)
 
-        # 后台启动 ping。
-        # 它会和后面的 iperf 同时经过瓶颈链路，用来观察拥塞时的小包延迟。
+        # 先启动后台 ping，1 秒后再启动 iperf client。
+        # ping 会覆盖 iperf 的大部分运行时间，用来观察拥塞时的小包延迟。
         h2.cmd("ping -c 30 -i 0.5 -W 2 %s >/tmp/bonus5_ping.log 2>&1 &" % h4.IP())
         time.sleep(1)
-
         # 前台启动 TCP 大流量。
         # 这里会阻塞 duration 秒，期间 h2 的 ping 正在后台持续运行。
         iperf_output = h1.cmd("iperf -c %s -p 5001 -t %s" % (h3.IP(), duration))
         time.sleep(1)
 
-        # 读取后台 ping 的完整输出。
+        # 读取后台 ping 的完整输出。再进行相应变量的解析。
         busy_ping = h2.cmd("cat /tmp/bonus5_ping.log")
 
         busy_loss, busy_rtt = parse_ping(busy_ping)
         throughput = parse_iperf(iperf_output)
-
-        print("Idle ping loss: %s%%" % idle_loss)
-        print("Idle ping avg RTT: %s ms" % idle_rtt)
-        print("TCP throughput: %s Mbits/sec" % throughput)
-        print("Busy ping loss: %s%%" % busy_loss)
-        print("Busy ping avg RTT: %s ms" % busy_rtt)
 
         return {
             "queue": queue_size,
@@ -218,13 +164,6 @@ def run_case(queue_size, duration):
 
 
 def print_summary(results):
-    """
-    打印最终汇总表。
-
-    重点看 busy_rtt：
-    如果大队列的 busy_rtt 明显高于小队列，
-    就说明 TCP 大流量在大队列中排队，造成了 Bufferbloat。
-    """
     print("\n===== Summary =====")
     print("queue\tthroughput(Mbps)\tidle_rtt(ms)\tbusy_rtt(ms)\tloss(%)")
     for item in results:
@@ -241,24 +180,14 @@ def print_summary(results):
 
 
 def main():
-    """
-    程序入口。
-
-    默认不加参数时会自动测试两组：
-    - queue=20：小队列；
-    - queue=1000：大队列。
-
-    也可以通过 --queue 只测一组，方便单独截图或调试。
-    """
+    # 进行测试，默认的小队列大小20packets，大队列大小1000packets，duration15s
     parser = argparse.ArgumentParser(description="Bonus5 Bufferbloat Mininet test")
-    parser.add_argument("--queue", type=int, help="只测试一个队列大小，例如 20 或 1000")
-    parser.add_argument("--duration", type=int, default=15, help="iperf 持续时间，默认 15 秒")
+    parser.add_argument("--queue", type=int, help="only test 1 queue size, for example 20 or 1000")
+    parser.add_argument("--duration", type=int, default=15, help="iperf duration, 15s by default")
     args = parser.parse_args()
-
     queues = [args.queue] if args.queue else [20, 1000]
     results = [run_case(queue, args.duration) for queue in queues]
     print_summary(results)
-
 
 if __name__ == "__main__":
     setLogLevel("info")
