@@ -1,0 +1,203 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue
+}
+
+\title{CS305 SDN Project Report}
+\author{
+    Tong Wu (12412460) \and
+    Zhikai Wang (12410615) \and
+    Yunzang Li (12410922)
+}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Project Overview}
+
+This project implements a centralized Software-Defined Networking controller on top of
+os-ken and Mininet. The controller is designed for a single-subnet Layer-2 network and
+supports three major functions:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item dynamic IP allocation through DHCP,
+    \item shortest-path forwarding with topology awareness,
+    \item packet filtering through switch-level firewall rules.
+\end{itemize}
+
+The main design goal is to keep the control logic inside the controller while leaving
+packet forwarding to OpenFlow switches created by Mininet. This separation makes it
+possible to react to host discovery, topology updates, and policy changes in a
+programmable and testable way.
+
+\section{System Architecture}
+
+The implementation is organized around the following core files:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{controller.py}: entry point of the SDN controller. It receives switch,
+    host, link, and packet events, maintains the global network view, installs forwarding
+    rules, and coordinates the DHCP and firewall modules.
+    \item \texttt{dhcp.py}: DHCP server implementation, including address pool management,
+    OFFER/ACK packet construction, timeout recovery, lease expiration, and duplicate
+    allocation prevention.
+    \item \texttt{firewall.py}: firewall rule loader and rule installation logic. It
+    converts high-level JSON rules into high-priority OpenFlow drop entries.
+    \item \texttt{ofctl\_utilis.py}: helper utilities for building and sending OpenFlow
+    messages and packets.
+    \item \texttt{tests/}: Mininet-based validation scripts for DHCP, switching,
+    firewall, DNS, and bonus experiments.
+\end{itemize}
+
+At runtime, Mininet builds the emulated network, while os-ken runs the controller.
+Switches connect to the controller through OpenFlow 1.0. Hosts generate DHCP, ARP, ICMP,
+TCP, and DNS traffic, and the controller decides how the network should react.
+
+\section{Implementation Details}
+
+\subsection{DHCP Module}
+
+The DHCP server is implemented as a stateful component. It keeps track of:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item pending offers,
+    \item confirmed leases,
+    \item lease expiration timestamps,
+    \item permanently rejected addresses.
+\end{itemize}
+
+When a DHCP DISCOVER packet arrives, the server selects an available address from the
+configured pool and creates a pending reservation. When a DHCP REQUEST packet is received,
+the reservation is confirmed and the controller replies with a DHCP ACK. The implementation
+also includes practical improvements beyond the minimum baseline:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item configurable address pool, netmask, lease time, and offer timeout through
+    environment variables,
+    \item recovery of expired offers,
+    \item lease expiration and renewal support,
+    \item sequential and conflict-free allocation under concurrent requests.
+\end{itemize}
+
+\subsection{Topology Learning and Shortest-Path Switching}
+
+The controller maintains a global topology view using switch, host, link, and port events.
+Hosts are learned from gratuitous ARP packets and ARP requests, while switch-to-switch
+links are learned from LLDP and topology APIs provided by os-ken.
+
+Once the topology is known, the controller computes shortest paths between switches using
+a breadth-first search over the current adjacency structure. For each destination host,
+the controller installs destination-MAC-based forwarding rules on every relevant switch.
+When the topology changes, the controller clears outdated forwarding rules and installs
+new ones according to the refreshed shortest paths.
+
+This design achieves:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item shortest-path forwarding in topologies with loops,
+    \item automatic path recovery after link or port changes,
+    \item controller-side ARP handling without broadcast flooding.
+\end{itemize}
+
+\subsection{Firewall Module}
+
+The firewall is implemented as a policy layer above normal forwarding. Rules are loaded
+from \texttt{firewall\_rule.json} and translated into high-priority OpenFlow drop flows.
+Each rule may match source IP, destination IP, protocol, source port, and destination port.
+
+Because firewall entries are installed with higher priority than the regular destination-MAC
+forwarding rules, blocked traffic is discarded at the switch before it can follow the normal
+shortest-path forwarding pipeline. This keeps the policy enforcement simple and efficient.
+
+\subsection{Testing and Demonstration Support}
+
+The project includes both baseline test scripts and extended demonstration scripts. In
+addition to the original DHCP, switching, and firewall tests, the project now includes:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item custom DHCP configuration tests,
+    \item pool exhaustion tests,
+    \item lease timeout and renewal tests,
+    \item a large complex topology for shortest-path demonstrations,
+    \item a matching complex topology for firewall demonstrations,
+    \item bonus experiments for DNS, TCP congestion, and bufferbloat.
+\end{itemize}
+
+An integrated script, \texttt{run\_all\_tests.sh}, is used to automate the main regression
+flow and generate logs for the full project.
+
+\section{Team Division of Work}
+
+We followed a module-oriented division strategy: each member took long-term ownership of a
+major subsystem, while the team merged changes continuously to reduce final integration
+risk.
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.26\textwidth} >{\raggedright\arraybackslash}p{0.42\textwidth} >{\raggedright\arraybackslash}p{0.24\textwidth}}
+\toprule
+\textbf{Member} & \textbf{Main Responsibilities} & \textbf{Key Files} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Member} & \textbf{Main Responsibilities} & \textbf{Key Files} \\
+\midrule
+\endhead
+Tong Wu (12412460)\\Role A: DHCP \& Bonus DHCP &
+DHCP basic workflow, lease management, duplicate allocation prevention, RFC-style option
+handling, and DHCP-related test cases &
+\texttt{dhcp.py}, \texttt{tests/dhcp\_test/}, DHCP bonus test scripts \\
+\midrule
+Zhikai Wang (12410615)\\Role B: Topology \& Switching &
+Topology event handling, ARP processing, shortest-path computation, forwarding rule
+installation, dynamic link update handling, and routing-related bonus extensions &
+\texttt{controller.py}, \texttt{ofctl\_utilis.py}, \texttt{tests/switching\_test/},
+complex topology scripts \\
+\midrule
+Yunzang Li (12410922)\\Role C: Firewall \& Report/Experiment &
+Firewall rule loading and installation, experiment-oriented bonus tasks, report
+organization, screenshots, and demonstration scripts &
+\texttt{firewall.py}, \texttt{firewall\_rule.json}, \texttt{tests/firewall\_test/},
+\texttt{report/} and experiment scripts \\
+\bottomrule
+\end{longtable}
+
+\section{Module Interfaces and Collaboration}
+
+The three modules were designed to collaborate through explicit interfaces:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item The DHCP module exposes \texttt{DHCPServer.handle\_dhcp(datapath, port, pkt)}.
+    The controller only needs to detect DHCP packets and delegate processing.
+    \item The switching module maintains the shared controller state:
+    \texttt{datapaths}, \texttt{ofctls}, \texttt{hosts}, \texttt{links}, and
+    \texttt{link\_ports}.
+    \item The firewall module exposes \texttt{Firewall.install\_rules(ofctls)} and relies
+    on the controller's switch abstractions to push rules consistently across the network.
+    \item Firewall drop rules are installed with higher priority than the normal forwarding
+    rules so that policy enforcement overrides path forwarding when necessary.
+\end{itemize}
+
+\section{Conclusion}
+
+The final project delivers a functional SDN controller that combines address allocation,
+shortest-path forwarding, and policy enforcement in a single os-ken application. The
+implementation is supported by reproducible Mininet test scripts and a complete report
+structure for demonstration. The modular division of work also made the project easier to
+develop, debug, and present as a team.
+
+\end{document}
