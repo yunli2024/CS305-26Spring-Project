@@ -25,6 +25,30 @@ cleanup() {
 }
 trap cleanup EXIT
 
+start_controller() {
+    local log_file="$1"
+    shift
+    "$@" "$OSKEN_MANAGER" --observe-links controller.py >"$log_file" 2>&1 &
+    CONTROLLER_PID=$!
+    sleep 3
+    if kill -0 "$CONTROLLER_PID" 2>/dev/null; then
+        mark_pass "controller started"
+        return 0
+    fi
+    tail -n 80 "$log_file"
+    echo "Controller failed to start"
+    exit 1
+}
+
+stop_controller() {
+    if [[ -n "$CONTROLLER_PID" ]] && kill -0 "$CONTROLLER_PID" 2>/dev/null; then
+        kill "$CONTROLLER_PID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$CONTROLLER_PID" 2>/dev/null || true
+    fi
+    CONTROLLER_PID=""
+}
+
 mark_fail() {
     echo "[FAIL] $1"
     FAILED=1
@@ -130,16 +154,7 @@ clean_mininet
 CONTROLLER_LOG="$LOG_DIR/controller.log"
 echo
 echo "===== controller ====="
-"$OSKEN_MANAGER" --observe-links controller.py >"$CONTROLLER_LOG" 2>&1 &
-CONTROLLER_PID=$!
-sleep 3
-if kill -0 "$CONTROLLER_PID" 2>/dev/null; then
-    mark_pass "controller started"
-else
-    tail -n 80 "$CONTROLLER_LOG"
-    echo "Controller failed to start"
-    exit 1
-fi
+start_controller "$CONTROLLER_LOG" env
 
 run_python_test "switching_basic" "tests/switching_test/test_network.py" $'pingall\nexit\n'
 require_log "switching_basic" '0% dropped \(6/6 received\)' "$LOG_DIR/switching_basic.log" || mark_fail "switching_basic assertion"
@@ -147,10 +162,54 @@ require_log "switching_basic" '0% dropped \(6/6 received\)' "$LOG_DIR/switching_
 run_python_test "switching_complex" "tests/switching_test/complex_topology.py"
 require_count_at_least "switching_complex" '0% dropped \(12/12 received\)' 2 "$LOG_DIR/switching_complex.log" || mark_fail "switching_complex assertion"
 
+run_python_test "switching_complex_demo" "tests/switching_test/complex_topology_demo.py"
+require_count_at_least "switching_complex_demo" '0% dropped \(42/42 received\)' 5 "$LOG_DIR/switching_complex_demo.log" || mark_fail "switching_complex_demo assertion"
+
 run_python_test "dhcp_basic" "tests/dhcp_test/test_network.py" $'h1 ifconfig h1-eth0\nh2 ifconfig h2-eth0\nh1 ping -c2 -W1 192.168.1.3\nexit\n'
 require_log "dhcp_basic h1" 'inet 192\.168\.1\.2' "$LOG_DIR/dhcp_basic.log" || mark_fail "dhcp_basic h1 IP"
 require_log "dhcp_basic h2" 'inet 192\.168\.1\.3' "$LOG_DIR/dhcp_basic.log" || mark_fail "dhcp_basic h2 IP"
 require_log "dhcp_basic ping" '0% packet loss' "$LOG_DIR/dhcp_basic.log" || mark_fail "dhcp_basic ping"
+
+echo
+echo "===== dhcp_custom_config ====="
+clean_mininet
+stop_controller
+CONTROLLER_LOG="$LOG_DIR/controller_dhcp_custom.log"
+echo "===== controller (dhcp custom config) ====="
+start_controller "$CONTROLLER_LOG" env DHCP_START_IP=10.10.0.10 DHCP_END_IP=10.10.0.12 DHCP_NETMASK=255.255.255.248
+sudo -n env DHCP_START_IP=10.10.0.10 DHCP_END_IP=10.10.0.12 DHCP_NETMASK=255.255.255.248 "$PYTHON_BIN" "$ROOT_DIR/tests/dhcp_test/test_custom_config.py" >"$LOG_DIR/dhcp_custom_config.log" 2>&1
+status=$?
+if (( status != 0 )); then
+    tail -n 80 "$LOG_DIR/dhcp_custom_config.log"
+    mark_fail "dhcp_custom_config exited with status $status"
+else
+    mark_pass "dhcp_custom_config completed"
+fi
+require_log "dhcp_custom_config" '\[PASS\] DHCP custom configuration test passed' "$LOG_DIR/dhcp_custom_config.log" || mark_fail "dhcp_custom_config assertion"
+
+echo
+echo "===== dhcp_small_pool_exhaustion ====="
+clean_mininet
+stop_controller
+CONTROLLER_LOG="$LOG_DIR/controller_dhcp_small_pool.log"
+echo "===== controller (dhcp small pool) ====="
+start_controller "$CONTROLLER_LOG" env DHCP_START_IP=10.10.0.10 DHCP_END_IP=10.10.0.12 DHCP_NETMASK=255.255.255.248
+sudo -n env DHCP_START_IP=10.10.0.10 DHCP_END_IP=10.10.0.12 DHCP_NETMASK=255.255.255.248 "$PYTHON_BIN" "$ROOT_DIR/tests/dhcp_test/test_small_pool_exhaustion.py" >"$LOG_DIR/dhcp_small_pool_exhaustion.log" 2>&1
+status=$?
+if (( status != 0 )); then
+    tail -n 80 "$LOG_DIR/dhcp_small_pool_exhaustion.log"
+    mark_fail "dhcp_small_pool_exhaustion exited with status $status"
+else
+    mark_pass "dhcp_small_pool_exhaustion completed"
+fi
+require_log "dhcp_small_pool_exhaustion" '\[PASS\] DHCP pool exhaustion test passed' "$LOG_DIR/dhcp_small_pool_exhaustion.log" || mark_fail "dhcp_small_pool_exhaustion assertion"
+
+clean_mininet
+stop_controller
+CONTROLLER_LOG="$LOG_DIR/controller.log"
+echo
+echo "===== controller ====="
+start_controller "$CONTROLLER_LOG" env
 
 run_python_test "firewall_basic" "tests/firewall_test/test_network.py" $'exit\n'
 require_log "firewall_basic blocked_icmp" '100% packet loss' "$LOG_DIR/firewall_basic.log" || mark_fail "firewall_basic blocked ICMP"
@@ -161,8 +220,19 @@ require_log "firewall_basic allowed_tcp8080" 'HTTP_CODE=200' "$LOG_DIR/firewall_
 run_python_test "dns_bonus" "tests/dns_test/test_network.py"
 require_log "dns_bonus" 'Summary: 4/4 checks passed' "$LOG_DIR/dns_bonus.log" || mark_fail "dns_bonus assertion"
 
+run_python_test "bonus_tcp_congestion" "tests/bonus5_tcp_congestion/test_tcp_congestion.py"
+require_log "bonus_tcp_congestion" '===== Result Summary =====' "$LOG_DIR/bonus_tcp_congestion.log" || mark_fail "bonus_tcp_congestion summary"
+require_log "bonus_tcp_congestion" 'fairness' "$LOG_DIR/bonus_tcp_congestion.log" || mark_fail "bonus_tcp_congestion fairness"
+
+run_python_test "bonus_bufferbloat" "tests/bonus5_bufferbloat/test_bufferbloat.py"
+require_log "bonus_bufferbloat" '===== Summary =====' "$LOG_DIR/bonus_bufferbloat.log" || mark_fail "bonus_bufferbloat summary"
+require_log "bonus_bufferbloat" 'queue[[:space:]]+throughput\(Mbps\)[[:space:]]+idle_rtt\(ms\)[[:space:]]+busy_rtt\(ms\)[[:space:]]+loss\(%\)' "$LOG_DIR/bonus_bufferbloat.log" || mark_fail "bonus_bufferbloat table"
+
 run_python_test "firewall_complex" "tests/firewall_test/firewall_complex_test.py"
 require_log "firewall_complex" 'Summary: 7/7 checks passed' "$LOG_DIR/firewall_complex.log" || mark_fail "firewall_complex assertion"
+
+run_python_test "firewall_complex_demo" "tests/firewall_test/firewall_complex_topology_demo.py"
+require_log "firewall_complex_demo" 'Summary: 7/7 checks passed' "$LOG_DIR/firewall_complex_demo.log" || mark_fail "firewall_complex_demo assertion"
 
 run_python_test "dhcp_offer_timeout" "tests/dhcp_test/test_offer_timeout.py"
 require_log "dhcp_offer_timeout" '\[Test3\] OFFER Timeout Reclaim: \[PASSED\]' "$LOG_DIR/dhcp_offer_timeout.log" || mark_fail "dhcp_offer_timeout assertion"
