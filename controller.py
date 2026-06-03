@@ -69,11 +69,6 @@ class ControllerApp(app_manager.OSKenApp):
         for key in list(self.link_ports):
             if dpid in key:
                 self.link_ports.pop(key, None)
-        for mac, host in list(self.hosts.items()):
-            if host["dpid"] == dpid:
-                self.hosts.pop(mac, None)
-                if host["ip"]:
-                    self.ip_to_mac.pop(host["ip"], None)
         self.clear_logged_paths()
         self.refresh_forwarding_rules()
 
@@ -81,14 +76,14 @@ class ControllerApp(app_manager.OSKenApp):
     def handle_host_add(self, ev):
         host = ev.host
         ip = host.ipv4[0] if host.ipv4 else None
-        self.learn_host(host.mac, ip, host.port.dpid, host.port.port_no)
-        self.refresh_forwarding_rules()
+        if self.learn_host(host.mac, ip, host.port.dpid, host.port.port_no):
+            self.refresh_forwarding_rules()
 
     @set_ev_cls(event.EventLinkAdd)
     def handle_link_add(self, ev):
-        self.record_link(ev.link.src, ev.link.dst)
-        self.clear_logged_paths()
-        self.refresh_forwarding_rules()
+        if self.record_link(ev.link.src, ev.link.dst):
+            self.clear_logged_paths()
+            self.refresh_forwarding_rules()
 
     @set_ev_cls(event.EventLinkDelete)
     def handle_link_delete(self, ev):
@@ -110,12 +105,6 @@ class ControllerApp(app_manager.OSKenApp):
             if key[0] == port.dpid and self.link_ports[key] == port.port_no:
                 self.links[key[0]].discard(key[1])
                 self.link_ports.pop(key, None)
-
-        for mac, host in list(self.hosts.items()):
-            if host["dpid"] == port.dpid and host["port"] == port.port_no:
-                self.hosts.pop(mac, None)
-                if host["ip"]:
-                    self.ip_to_mac.pop(host["ip"], None)
         self.clear_logged_paths()
         self.refresh_forwarding_rules()
 
@@ -163,14 +152,17 @@ class ControllerApp(app_manager.OSKenApp):
         except LLDPPacket.LLDPUnknownFormat:
             return
         if src_dpid != datapath.id:
-            self.record_link_values(src_dpid, src_port, datapath.id, in_port)
-            self.refresh_forwarding_rules()
+            if self.record_link_values(src_dpid, src_port, datapath.id, in_port):
+                self.refresh_forwarding_rules()
 
     def handle_arp(self, datapath, in_port, pkt_arp):
-        self.learn_host(pkt_arp.src_mac, pkt_arp.src_ip, datapath.id, in_port)
+        host_changed = self.learn_host(
+            pkt_arp.src_mac, pkt_arp.src_ip, datapath.id, in_port
+        )
 
         if pkt_arp.opcode != arp.ARP_REQUEST:
-            self.refresh_forwarding_rules()
+            if host_changed:
+                self.refresh_forwarding_rules()
             return
 
         if self.dns_server.is_dns_ip(pkt_arp.dst_ip):
@@ -181,17 +173,21 @@ class ControllerApp(app_manager.OSKenApp):
                 self.dns_server.server_mac,
                 pkt_arp.dst_ip,
             )
-            self.refresh_forwarding_rules()
+            if host_changed:
+                self.refresh_forwarding_rules()
             return
 
         target_mac = self.ip_to_mac.get(pkt_arp.dst_ip)
         if target_mac is None:
             self.logger.info("Unknown ARP target %s from %s",
                              pkt_arp.dst_ip, pkt_arp.src_ip)
+            if host_changed:
+                self.refresh_forwarding_rules()
             return
 
         self.send_arp_reply(datapath, in_port, pkt_arp, target_mac, pkt_arp.dst_ip)
-        self.refresh_forwarding_rules()
+        if host_changed:
+            self.refresh_forwarding_rules()
 
     def send_arp_reply(self, datapath, out_port, request, sender_mac, sender_ip):
         ofctl = self.ofctls.get(datapath.id)
@@ -211,34 +207,52 @@ class ControllerApp(app_manager.OSKenApp):
 
     def learn_host(self, mac, ip, dpid, port):
         if not mac or mac == "ff:ff:ff:ff:ff:ff":
-            return
+            return False
         if ip == "0.0.0.0":
             ip = None
 
         old = self.hosts.get(mac)
+        # Topology rediscovery can report a host before any L3 packet arrives.
+        # Preserve the known IP in that case instead of dropping ARP resolution.
+        if ip is None and old and old.get("ip"):
+            ip = old["ip"]
+
         if old and old.get("ip") and old["ip"] != ip:
             self.ip_to_mac.pop(old["ip"], None)
 
-        self.hosts[mac] = {"ip": ip, "dpid": dpid, "port": port}
+        new_value = {"ip": ip, "dpid": dpid, "port": port}
+        self.hosts[mac] = new_value
         if ip:
             self.ip_to_mac[ip] = mac
-        if old != self.hosts[mac]:
+        if old != new_value:
             self.clear_logged_paths(mac)
+            return True
+        return False
 
     def record_link(self, src, dst):
-        self.record_link_values(src.dpid, src.port_no, dst.dpid, dst.port_no)
+        return self.record_link_values(src.dpid, src.port_no, dst.dpid, dst.port_no)
 
     def record_link_values(self, src_dpid, src_port, dst_dpid, dst_port):
         if src_dpid == dst_dpid:
-            return
+            return False
         if (src_dpid, src_port) in self.down_ports:
-            return
+            return False
         if (dst_dpid, dst_port) in self.down_ports:
-            return
+            return False
+        changed = False
+        if dst_dpid not in self.links[src_dpid]:
+            changed = True
+        if src_dpid not in self.links[dst_dpid]:
+            changed = True
+        if self.link_ports.get((src_dpid, dst_dpid)) != src_port:
+            changed = True
+        if self.link_ports.get((dst_dpid, src_dpid)) != dst_port:
+            changed = True
         self.links[src_dpid].add(dst_dpid)
         self.links[dst_dpid].add(src_dpid)
         self.link_ports[(src_dpid, dst_dpid)] = src_port
         self.link_ports[(dst_dpid, src_dpid)] = dst_port
+        return changed
 
     def remove_link(self, src, dst):
         self.links[src.dpid].discard(dst.dpid)
@@ -247,18 +261,36 @@ class ControllerApp(app_manager.OSKenApp):
         self.link_ports.pop((dst.dpid, src.dpid), None)
 
     def sync_topology_links(self):
+        rebuilt_links = defaultdict(set)
+        rebuilt_ports = {}
+
+        def add_discovered_link(src, dst):
+            if src.dpid == dst.dpid:
+                return
+            if src.dpid not in self.datapaths or dst.dpid not in self.datapaths:
+                return
+            rebuilt_links[src.dpid].add(dst.dpid)
+            rebuilt_links[dst.dpid].add(src.dpid)
+            rebuilt_ports[(src.dpid, dst.dpid)] = src.port_no
+            rebuilt_ports[(dst.dpid, src.dpid)] = dst.port_no
+            self.down_ports.discard((src.dpid, src.port_no))
+            self.down_ports.discard((dst.dpid, dst.port_no))
+
         if self.switches is not None:
             for link in list(self.switches.links):
-                self.record_link(link.src, link.dst)
+                add_discovered_link(link.src, link.dst)
 
         try:
             discovered = get_link(self, None)
         except Exception as exc:
             self.logger.debug("get_link failed: %s", exc)
-            return
+            discovered = []
 
         for link in discovered:
-            self.record_link(link.src, link.dst)
+            add_discovered_link(link.src, link.dst)
+
+        self.links = rebuilt_links
+        self.link_ports = rebuilt_ports
 
     def shortest_path(self, src_dpid, dst_dpid):
         if src_dpid == dst_dpid:

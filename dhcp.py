@@ -1,4 +1,5 @@
 
+import os
 import time
 import ipaddress #解析、验证和操作 IPv4 和 IPv6 地址/网段
 from typing import Optional #允许变量为“空”的类型提示
@@ -17,11 +18,11 @@ from os_ken.lib.packet import dhcp
 class Config:
     controller_macAddr = '7e:49:b3:f0:f9:99'   # SDN 控制器的虚拟 MAC
     dns          = '192.168.1.1'  # controller-hosted DNS server for bonus 4
-    start_ip     = '192.168.1.2'
-    end_ip       = '192.168.1.11'  # 10-address pool used by the DHCP bonus tests
-    netmask      = '255.255.255.0'
-    lease_time   = 30          # 租期：30 秒，匹配租约过期/续租测试
-    offer_timeout = 10            # OFFER 待确认超时（秒），RFC 建议值
+    start_ip     = os.environ.get('DHCP_START_IP', '192.168.1.2')
+    end_ip       = os.environ.get('DHCP_END_IP', '192.168.1.11')  # 10-address pool used by the DHCP bonus tests
+    netmask      = os.environ.get('DHCP_NETMASK', '255.255.255.0')
+    lease_time   = int(os.environ.get('DHCP_LEASE_TIME', '30'))  # 租期：30 秒，匹配租约过期/续租测试
+    offer_timeout = int(os.environ.get('DHCP_OFFER_TIMEOUT', '10'))  # OFFER 待确认超时（秒），RFC 建议值
 
 
 # ──────────────────────────────────────────────
