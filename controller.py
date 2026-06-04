@@ -1,5 +1,10 @@
 from collections import defaultdict, deque
 
+try:
+    import networkx as nx
+except ImportError:  # optional logging dependency
+    nx = None
+
 from os_ken.base import app_manager
 from os_ken.controller import ofp_event
 from os_ken.controller.handler import MAIN_DISPATCHER, set_ev_cls
@@ -31,6 +36,7 @@ class ControllerApp(app_manager.OSKenApp):
         self.down_ports = set()
         self.forward_macs = set()
         self.logged_paths = {}
+        self.logged_switch_paths = {}
         self.firewall = Firewall()
         self.dns_server = DNSServer()
 
@@ -310,8 +316,47 @@ class ControllerApp(app_manager.OSKenApp):
                 queue.append((neighbor, next_path))
         return None
 
+    def log_topology_structure(self):
+        if nx is None:
+            return
+
+        graph = nx.Graph()
+        for dpid in sorted(self.datapaths):
+            graph.add_node("s%s" % dpid)
+        for src_dpid, neighbors in self.links.items():
+            for dst_dpid in neighbors:
+                if src_dpid < dst_dpid:
+                    graph.add_edge("s%s" % src_dpid, "s%s" % dst_dpid)
+
+        nodes = sorted(graph.nodes())
+        edges = sorted(graph.edges())
+        self.logger.info("Current topology nodes: %s", nodes)
+        self.logger.info("Current topology edges: %s", edges)
+
+    def log_switch_paths(self):
+        active_switches = sorted(self.datapaths)
+        for index, src_dpid in enumerate(active_switches):
+            for dst_dpid in active_switches[index + 1:]:
+                path = self.shortest_path(src_dpid, dst_dpid)
+                if not path:
+                    continue
+                signature = tuple(path)
+                key = (src_dpid, dst_dpid)
+                if self.logged_switch_paths.get(key) == signature:
+                    continue
+                self.logged_switch_paths[key] = signature
+                self.logger.info(
+                    "Switch shortest path s%s -> s%s: %s, %s edges",
+                    src_dpid,
+                    dst_dpid,
+                    " -> ".join("s%s" % dpid for dpid in path),
+                    len(path) - 1,
+                )
+
     def refresh_forwarding_rules(self):
         self.sync_topology_links()
+        self.log_topology_structure()
+        self.log_switch_paths()
         self.clear_forwarding_rules()
 
         for dst_mac, dst_host in self.hosts.items():
@@ -393,6 +438,7 @@ class ControllerApp(app_manager.OSKenApp):
     def clear_logged_paths(self, mac=None):
         if mac is None:
             self.logged_paths.clear()
+            self.logged_switch_paths.clear()
             return
         for key in list(self.logged_paths):
             if mac in key:
