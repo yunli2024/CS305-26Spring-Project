@@ -16,9 +16,12 @@
 
 \lstset{
     basicstyle=\ttfamily\small,
+    commentstyle=\ttfamily\small,
     breaklines=true,
     frame=single,
-    columns=fullflexible
+    columns=fullflexible,
+    keepspaces=true,
+    showstringspaces=false
 }
 
 \hypersetup{
@@ -215,6 +218,12 @@ The DNS bonus extends the controller with a controller-hosted DNS service. DNS r
 are detected in \texttt{controller.py} and answered according to static records defined in
 \texttt{dns\_records.json}.
 
+\paragraph{DHCP Lease Management and RFC Optimization.}
+The DHCP bonus extends the baseline allocator with practical lease lifecycle management
+and stronger RFC 2131 compliance. The implementation supports lease expiration reclaim,
+OFFER timeout cleanup, lease renewal, atomic reservation to avoid duplicate allocation,
+and conflict handling through DHCP DECLINE.
+
 \paragraph{TCP Congestion.}
 The TCP congestion bonus is an experiment built with Mininet rather than a controller-side
 feature. It compares TCP algorithms such as Reno and Cubic under the same bottleneck and
@@ -269,8 +278,6 @@ scenarios. The main required tests are grouped into three categories.
     \item Custom DHCP configuration with modified \texttt{start\_ip}, \texttt{end\_ip},
     and \texttt{netmask}.
     \item Address pool exhaustion where the number of hosts exceeds the pool size.
-    \item Bonus DHCP tests for lease timeout reclaim, concurrent allocation, lease
-    expiration, and renewal.
 \end{itemize}
 
 \begin{figure}[H]
@@ -372,10 +379,281 @@ rules when the topology changes.
 
 \section{Bonus Results and Analysis}
 
+\clearpage
+\subsection{DHCP Bonus}
+
+The DHCP bonus extends the baseline allocator into a more complete DHCP service. On the
+server side, four state tables are maintained for pending offers, confirmed leases, lease
+expiration timestamps, and declined addresses that must not be reassigned. These states
+are sufficient to support lease recycling, renewal, and conflict handling in a structured
+way.
+
+\subsubsection{DHCP State Machine}
+
+The implementation follows the RFC 2131 client lifecycle rather than treating DHCP as a
+single DORA exchange. In particular, the server distinguishes the ordinary
+\texttt{DISCOVER -> OFFER -> REQUEST -> ACK} path from INIT-REBOOT, RENEWING, and
+REBINDING requests, and it also supports explicit RELEASE and DECLINE handling. The
+result is a lease manager rather than a one-time address allocator.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.82\textwidth]{img/dhcp_state.png}
+    \caption{RFC 2131 client-side DHCP state transitions referenced by the lease-management logic.}
+\end{figure}
+
+This state machine is reflected directly in \texttt{dhcp.py}. The REQUEST handler does
+not treat all REQUEST messages as identical. Instead, it classifies them using
+\texttt{ciaddr}, Option 50, and Option 54, then applies the corresponding RFC logic.
+
+\begin{lstlisting}[language=Python]
+if ciaddr == '0.0.0.0' and requested_ip and server_id_opt:
+    # SELECTING
+    ...
+
+if ciaddr == '0.0.0.0' and requested_ip and not server_id_opt:
+    # INIT-REBOOT
+    ...
+
+if ciaddr and ciaddr != '0.0.0.0':
+    # RENEWING / REBINDING
+    ...
+\end{lstlisting}
+
+\subsubsection{Lease Expiration}
+
+Lease expiration determines when an address can be returned to the pool without manual
+intervention. The server stores an expiration timestamp for each confirmed lease and
+reclaims that lease once the current time exceeds the recorded deadline.
+
+\begin{lstlisting}[language=Python]
+@classmethod
+def _is_expired(cls, ip: str) -> bool:
+    expiry = cls.lease_expiry.get(ip)
+    return expiry is not None and time.time() > expiry
+
+@classmethod
+def _reclaim_expired(cls):
+    now = time.time()
+
+    expired_macs = [
+        mac for mac, ip in cls.ip_pool.items()
+        if cls._is_expired(ip)
+    ]
+    for mac in expired_macs:
+        ip = cls.ip_pool.pop(mac)
+        cls.lease_expiry.pop(ip, None)
+\end{lstlisting}
+
+The natural-expiration test is used as the primary demonstration for this part. After the
+configured lease interval elapses, the original lease is reclaimed on the server side and
+the client can request a fresh lease again. This directly verifies expiration and reuse.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.82\textwidth]{img/lease_guoqi.png}
+    \caption{Lease expiration test: the original lease is allowed to expire, the client state is cleared, and a new lease is requested successfully.}
+\end{figure}
+
+\subsubsection{Duplicate-IP Prevention}
+
+To avoid duplicate allocation, the allocator performs reservation atomically. Before
+returning a new address, it first reclaims expired resources, then checks both the
+confirmed lease table and the pending-offer table, and immediately records the
+reservation in \mbox{\texttt{pending\_offers}}. This prevents two nearby DISCOVER requests from
+observing the same address as free.
+
+\begin{lstlisting}[language=Python]
+@classmethod
+def _allocate_ip(cls, client_mac: str) -> Optional[str]:
+    cls._reclaim_expired()
+
+    if client_mac in cls.ip_pool:
+        return cls.ip_pool[client_mac]
+    if client_mac in cls.pending_offers:
+        return cls.pending_offers[client_mac]["ip"]
+
+    in_use = cls._in_use_ips()
+    for ip in cls._build_ip_range():
+        if ip not in in_use and ip not in cls.bad_ips:
+            cls.pending_offers[client_mac] = {
+                "ip": ip,
+                "timestamp": time.time(),
+            }
+            return ip
+    return None
+\end{lstlisting}
+
+The concurrent-allocation tests were useful during development, but the screenshots are
+less informative than the allocator logic itself. For that reason, the report keeps the
+mechanism and omits the redundant test images here.
+
+\subsubsection{OFFER Timeout Reclaim}
+
+The server also cleans up stale \mbox{\texttt{pending\_offers}}. If a client receives an OFFER
+but never confirms it with REQUEST, that reservation is released after
+\texttt{offer\_timeout} seconds and the address returns to the reusable pool.
+
+\begin{lstlisting}[language=Python]
+expired_offer_macs = [
+    mac for mac, info in cls.pending_offers.items()
+    if now - info["timestamp"] > cls.offer_timeout
+]
+for mac in expired_offer_macs:
+    info = cls.pending_offers.pop(mac)
+\end{lstlisting}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.72\textwidth]{img/dhcp_test3.png}
+    \caption{DHCP OFFER-timeout reclaim test result.}
+\end{figure}
+
+\subsubsection{Lease Renewal}
+
+For RENEWING and REBINDING, the client already owns an address, so the server validates
+that the requested \texttt{ciaddr} still belongs to the same MAC address and then extends
+the lease deadline. This keeps renewal tied to the correct lease record.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.72\textwidth]{img/dhcp_test2.png}
+    \caption{Lease renewal test: the client renews the existing lease before expiration and keeps the assigned address.}
+\end{figure}
+
+\begin{lstlisting}[language=Python]
+if ciaddr and ciaddr != '0.0.0.0':
+    existing_ip = cls.ip_pool.get(client_mac)
+    if existing_ip != ciaddr:
+        return cls._build_nak_pkt(client_mac, xid)
+    if cls._is_expired(ciaddr):
+        cls.ip_pool.pop(client_mac, None)
+        cls.lease_expiry.pop(ciaddr, None)
+        return cls._build_nak_pkt(client_mac, xid)
+
+    cls.lease_expiry[ciaddr] = time.time() + cls.lease_time
+    return cls._build_reply_pkt(
+        client_mac, xid, ciaddr, dhcp.DHCP_ACK,
+        unicast_ip=ciaddr
+    )
+\end{lstlisting}
+
+\subsubsection{DHCPNAK Handling}
+
+The server constructs RFC-compliant DHCPNAK packets for invalid or inconsistent requests.
+In particular, the reply uses \texttt{yiaddr = 0.0.0.0} and is broadcast, since the
+client may not currently hold a usable IP address.
+
+\begin{lstlisting}[language=Python]
+@classmethod
+def _build_nak_pkt(cls, client_mac: str, xid: int) -> packet.Packet:
+    dhcp_pkt = dhcp.dhcp(
+        op=dhcp.DHCP_BOOT_REPLY,
+        chaddr=client_mac,
+        siaddr=cls._gateway_ip,
+        yiaddr='0.0.0.0',
+        xid=xid,
+        boot_file='',
+        options=options,
+    )
+\end{lstlisting}
+
+\subsubsection{DECLINE and RELEASE}
+
+The implementation also supports active lease release and conflict reporting. RELEASE
+immediately returns the address to the pool, while DECLINE removes the address from the
+current state tables and inserts it into \mbox{\texttt{bad\_ips}} so that it is not handed out
+again after a detected conflict.
+
+\begin{lstlisting}[language=Python]
+@classmethod
+def _handle_release(cls, pkt):
+    ip = cls.ip_pool.pop(client_mac, None)
+    if ip:
+        cls.lease_expiry.pop(ip, None)
+    cls.pending_offers.pop(client_mac, None)
+
+@classmethod
+def _handle_decline(cls, pkt):
+    ...
+    cls.bad_ips.add(declined_ip)
+\end{lstlisting}
+
+\subsubsection{Broadcast and Unicast Reply Selection}
+
+The reply path distinguishes initialization from renewal. OFFER and initial ACK replies
+are broadcast when the client does not yet have an address, while renewal ACK replies may
+be unicast to the client's current IP.
+
+\begin{lstlisting}[language=Python]
+use_broadcast = unicast_ip is None
+dst_mac = 'ff:ff:ff:ff:ff:ff' if use_broadcast else client_mac
+dst_ip  = '255.255.255.255' if use_broadcast else unicast_ip
+\end{lstlisting}
+
 \subsection{DNS Bonus}
 
 The DNS bonus demonstrates that the controller can also act as a simple DNS responder.
 This shows that the same SDN controller can host protocol logic beyond DHCP and forwarding.
+
+The implementation is controller-side rather than host-side. A dedicated DNS helper is
+initialized from a static JSON record file and attached to the controller. When a switch
+joins, the controller installs a high-priority PacketIn flow for IPv4 UDP destination
+port 53, so DNS queries are sent to the controller instead of being handled by ordinary
+shortest-path forwarding. In parallel, ARP requests for the virtual DNS IP
+\texttt{192.168.1.1} are answered by the controller, allowing hosts to send UDP packets
+to a controller-hosted virtual DNS server.
+
+The DNS response path is implemented directly in \texttt{dns\_server.py}. The controller
+extracts the UDP payload, parses the DNS question, looks up the queried name in the
+static table, and then builds a complete DNS response frame for PacketOut delivery back
+to the requesting host.
+
+\begin{lstlisting}[language=Python]
+def install_packetin_flow(self, datapath, ofctl, ether_types, inet, vlan_id):
+    actions = [
+        datapath.ofproto_parser.OFPActionOutput(
+            datapath.ofproto.OFPP_CONTROLLER,
+            0xFFFF,
+        )
+    ]
+    ofctl.set_flow(
+        cookie=self.COOKIE,
+        priority=self.PACKETIN_PRIORITY,
+        dl_type=ether_types.ETH_TYPE_IP,
+        dl_vlan=vlan_id,
+        nw_proto=inet.IPPROTO_UDP,
+        tp_dst=self.DNS_PORT,
+        actions=actions,
+    )
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python]
+def build_response(self, query):
+    query_id, flags, qdcount, _, _, _ = struct.unpack("!HHHHHH", query[:12])
+    question_end, qname = self._read_qname(query, 12)
+    question = query[12:question_end + 4]
+    qtype, qclass = struct.unpack("!HH", query[question_end:question_end + 4])
+    answer_ip = self.records.get(self._normalize_name(qname))
+
+    answer = b""
+    rcode = 0
+    if qtype == 1 and qclass == 1 and answer_ip:
+        answer = self._build_a_answer(answer_ip)
+    elif qtype == 1 and qclass == 1:
+        rcode = 3
+
+    response_flags = 0x8000 | 0x0400 | (flags & 0x0100) | rcode
+    header = struct.pack("!HHHHHH", query_id, response_flags, 1, 1 if answer else 0, 0, 0)
+    return header + question + answer
+\end{lstlisting}
+
+The test topology is a simple \texttt{h1-s1-h2} network. Three DNS cases are checked:
+\texttt{web.cs305.local} resolving to \texttt{192.168.1.3},
+\texttt{h1.cs305.local} resolving to \texttt{192.168.1.2}, and an unknown name returning
+\texttt{NXDOMAIN}. The script also runs \texttt{pingAll()} to verify that normal
+forwarding behavior is not broken by the DNS extension, and it prints the switch flow
+table to confirm that the UDP/53 PacketIn rule is present.
 
 \begin{figure}[H]
     \centering
@@ -388,6 +666,50 @@ This shows that the same SDN controller can host protocol logic beyond DHCP and 
 The TCP congestion experiment compares algorithm behavior under the same bottleneck.
 Our results show that the different algorithms produce different throughput values, while
 fairness remains close to 1 in the shared-flow scenario.
+
+This bonus is implemented as a Mininet experiment rather than a controller feature. The
+topology contains four hosts and two switches, with a single bottleneck link between
+\texttt{s1} and \texttt{s2}. Access links are configured as \texttt{100 Mbps, 1 ms},
+while the bottleneck link is configured as \texttt{10 Mbps, 30 ms, 0.5\% loss, queue
+size 100}. The loss is introduced directly by \texttt{TCLink} to create a controlled
+environment for comparing the recovery behavior of different TCP congestion-control
+algorithms.
+
+The script performs two experiments. The first is a single-flow test, where
+\texttt{h1 -> h2} runs once with Reno and once with CUBIC. The second is a fairness test,
+where \texttt{h1 -> h2} uses Reno and \texttt{h3 -> h4} uses CUBIC simultaneously while
+sharing the same bottleneck. Throughput is parsed from \texttt{iperf} output, and
+fairness is computed with Jain's fairness index.
+
+\begin{lstlisting}[language=Python]
+def set_tcp_algorithm(host, algorithm):
+    host.cmd("modprobe tcp_%s 2>/dev/null || true" % algorithm)
+    output = host.cmd(
+        "sysctl -w net.ipv4.tcp_congestion_control=%s 2>&1" % algorithm
+    )
+    current = host.cmd("sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null").strip()
+    if current != algorithm:
+        return False
+    return True
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python]
+def jain_fairness(x1, x2):
+    if x1 is None or x2 is None:
+        return None
+    denominator = 2 * (x1 ** 2 + x2 ** 2)
+    if denominator == 0:
+        return None
+    return (x1 + x2) ** 2 / denominator
+\end{lstlisting}
+
+The expected qualitative result is that CUBIC usually achieves higher average throughput
+than Reno in the single-flow case because it recovers the congestion window more
+aggressively after loss. At the same time, the fairness test is expected to remain close
+to 1, meaning that the two flows still share the bottleneck reasonably evenly even though
+their congestion-control behavior differs. In our repeated runs, this is exactly the
+trend that appears: CUBIC shows better average single-flow throughput, while fairness
+stays high overall.
 
 \begin{figure}[H]
     \centering
@@ -406,6 +728,49 @@ fairness remains close to 1 in the shared-flow scenario.
 The bufferbloat experiment shows the classic tradeoff between throughput and delay.
 With a very large queue, packet loss can decrease and throughput can improve, but the
 busy RTT becomes much larger, which clearly demonstrates queueing delay inflation.
+
+This experiment reuses the same two-switch structure but changes the bottleneck
+configuration. The access links remain \texttt{100 Mbps, 1 ms}, while the
+\texttt{s1-s2} bottleneck is set to \texttt{1 Mbps, 20 ms}. The only parameter varied
+between experiments is the bottleneck queue size: a small queue of \texttt{20 packets}
+and a large queue of \texttt{1000 packets}.
+
+Two traffic types are run simultaneously. A long-lived TCP flow from \texttt{h1} to
+\texttt{h3} is generated with \texttt{iperf}, and an interactive probe flow from
+\texttt{h2} to \texttt{h4} is generated with \texttt{ping}. The script first measures an
+idle RTT baseline, then starts the background ping process, launches the TCP bulk
+transfer, and finally parses both the \texttt{iperf} output and the ping statistics.
+
+\begin{lstlisting}[language=Python]
+def parse_ping(output):
+    loss_match = re.search(r"(\d+(?:\.\d+)?)% packet loss", output)
+    rtt_match = re.search(
+        r"(?:rtt|round-trip) min/avg/max/(?:mdev|stddev) = "
+        r"[\d.]+/([\d.]+)/[\d.]+/[\d.]+",
+        output,
+    )
+    loss = float(loss_match.group(1)) if loss_match else None
+    avg_rtt = float(rtt_match.group(1)) if rtt_match else None
+    return loss, avg_rtt
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python]
+idle_ping = ping(h2, h4.IP())
+idle_loss, idle_rtt = parse_ping(idle_ping)
+h3.cmd("iperf -s -p 5001 >/tmp/bonus5_iperf_server.log 2>&1 &")
+h2.cmd("ping -c 30 -i 0.5 -W 2 %s >/tmp/bonus5_ping.log 2>&1 &" % h4.IP())
+iperf_output = h1.cmd("iperf -c %s -p 5001 -t %s" % (h3.IP(), duration))
+busy_ping = h2.cmd("cat /tmp/bonus5_ping.log")
+busy_loss, busy_rtt = parse_ping(busy_ping)
+throughput = parse_iperf(iperf_output)
+\end{lstlisting}
+
+The expected outcome is a classic bufferbloat pattern. The large queue tends to reduce
+loss and may improve TCP throughput because packets are buffered instead of being dropped
+early. However, that same queue causes small interactive packets to wait behind the TCP
+bulk transfer, so the busy RTT rises sharply. In our measured results, the large queue
+indeed produced higher throughput and lower loss, but at the cost of dramatically larger
+RTT under load, which is the core symptom of bufferbloat.
 
 \begin{figure}[H]
     \centering
