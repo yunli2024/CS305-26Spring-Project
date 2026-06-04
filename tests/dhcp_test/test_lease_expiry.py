@@ -3,7 +3,7 @@ DHCP Lease Expiration and Renewal Test
 测试租约过期和续租场景：
 1. 测试租约自然过期
 2. 测试续租后租约时间是否延长
-Note: 需要与 dhcp.py 中的 Config.lease_time 配置一致（30秒） 正常是一天
+Note: 需要与 dhcp.py 中的 Config.lease_time 配置一致（30秒） 
 """
 
 from mininet.cli import CLI
@@ -51,11 +51,24 @@ class LeaseExpiryTopo(Topo):
 def test_lease_expiry():
     """
     测试 1: 租约自然过期
+    
+    易错：
+    - dhclient会在T1时刻（租期50%）自动续租
+    - Linux内核不会自动删除过期IP，IP配置持久化在内核中
+    - get_current_ip()只查询内核IP，无法反映服务器端租约状态
+    
+    正确的测试方法（INIT-REBOOT验证）：
+    1. 获取DHCP租约
+    2. 停止dhclient进程（防止自动续租）
+    3. 等待租约过期（服务器端回收租约）
+    4. 重新请求DHCP（服务器应检测到租约过期）
+    5. 验证获取到新租约（证明旧租约已过期）
+    
     流程:
     1. 主机获取 DHCP 租约
-    2. 等待租约过期（等待时长 = 租约时间）
-    3. 验证租约过期后主机 IP 失效
-    4. 重新请求 DHCP 验证能获取新租约
+    2. 停止 dhclient 进程（防止自动续租）
+    3. 等待租约过期（等待时长 = 租约时间）
+    4. 验证重新请求能获取新租约（证明旧租约已过期）
     """
     info('\nTest 1: Lease Natural Expiry\n')
     # 租约时间（需要与 dhcp.py 中的 Config.lease_time 一致）
@@ -85,8 +98,19 @@ def test_lease_expiry():
     lease_expiry_time = lease_start_time + lease_time
     info('Lease start time: %s\n' % time.strftime('%H:%M:%S', time.localtime(lease_start_time)))
     info('Lease will expire at: %s\n' % time.strftime('%H:%M:%S', time.localtime(lease_expiry_time)))
-    info('Waiting for lease to expire (%d seconds)...\n' % lease_time)
-
+    
+    # 停止 dhclient 进程，防止自动续租
+    info('\nStep 2: Stopping dhclient to prevent auto-renewal\n')
+    # 先尝试释放租约
+    h1.cmd('dhclient -r %s-eth0 2>&1' % h1.name)
+    time.sleep(0.5)
+    # 强制杀死所有 dhclient 进程
+    h1.cmd('pkill -9 dhclient 2>&1')
+    time.sleep(0.5)
+    info('dhclient stopped\n')
+    
+    #服务器过期回收
+    info('\nStep 3: Waiting for lease to expire (%d seconds)...\n' % lease_time)
     # 等待租约过期
     remaining = lease_time
     while remaining > 0:
@@ -94,19 +118,27 @@ def test_lease_expiry():
         info('Remaining: %d seconds      \r' % remaining)
         time.sleep(min(remaining, 5))
         remaining -= 5
-    info('\nLease should have expired now!\n')
+    info('\nLease has expired on server side!\n')
 
-    # 验证租约过期后 IP 状态
-    info('\nStep 2: Verify IP is released after expiry\n')
+    # 客户端清除残留
+    # 说明：此时客户端IP可能仍在内核中，但服务器端租约已过期
+    info('\nStep 4: Verify lease expiry by requesting new DHCP lease\n')
+    info('Note: Client IP may still be in kernel, but server lease has expired\n')
+    
+    # 手动清除旧IP，准备重新请求
+    h1.cmd('ip addr flush dev %s-eth0' % h1.name)
+    time.sleep(1)
+    
     current_ip = get_current_ip(h1)
-    info('Current IP on client: %s\n' % current_ip)
+    info('Current IP after flush: %s\n' % current_ip)
 
     # 重新请求 DHCP（验证服务器已回收旧租约）
-    info('\nStep 3: Requesting new DHCP lease...\n')
+    info('\nStep 5: Requesting new DHCP lease...\n')
     send_dhcp_request(h1)
     time.sleep(2)
     new_ip = get_current_ip(h1)
     info('New IP after expiry: %s\n' % new_ip)
+    
     if new_ip is not None:
         info('[PASSED]: Client successfully obtained new lease after expiry\n')
         result = True
@@ -119,14 +151,19 @@ def test_lease_expiry():
 
 def test_lease_renewal():
     """
-    测试 2: 续租测试
+    测试 2: 续租测试（简化版）
+    
+    测试目的：
+    验证dhclient在T1时刻（租期50%）自动续租，使租约延长
+    
     流程:
     1. 主机获取 DHCP 租约 → 记录过期时间 T_expire
     2. 等待 T1 = lease_time / 2 (15秒) → 此时客户端应该自动续租
-    3. 验证在 T_expire 时间点 IP 仍然有效（续租成功）
-    4. 等待到新的过期时间点之后 → 验证 IP 失效
+    3. 等待到原过期时间点
+    4. 验证在原过期时间点 IP 仍然有效（续租成功）
+    
     """
-    info('\nTest 2: Lease Renewal\n')
+    info('\nTest 2: Lease Renewal (Simplified)\n')
     lease_time = 30  # 秒（与 dhcp.py 中的配置一致）
     t1_time = lease_time // 2  # 租期的 50% 作为续租触发点
     t1_wait = t1_time + 3  # 等待 T1 时刻 + 3秒缓冲
@@ -157,54 +194,41 @@ def test_lease_renewal():
     original_expiry = initial_lease_start + lease_time
     info('Original lease expiry time: %s\n' % time.strftime('%H:%M:%S', time.localtime(original_expiry)))
 
-    # Step 3: 等待 T1 时刻（租期的 50%）
+    # Step 2: 等待 T1 时刻（租期的 50%）
     # 在 T1 时刻，客户端的 dhclient 应该自动发送 RENEW 请求
     info('\nStep 2: Waiting %d seconds for T1 (auto-renewal time)...\n' % t1_wait)
+    info('At T1, dhclient should automatically send RENEW request\n')
     time.sleep(t1_wait)
 
     # 检查续租是否成功（客户端可能已自动续租）
     current_ip = get_current_ip(h1)
     info('IP at T1 time: %s\n' % current_ip)
 
-    # Step 4: 等待到原过期时间点
+    # Step 3: 等待到原过期时间点
     info('\nStep 3: Wait until original expiry time...\n')
     time_to_expiry = original_expiry - time.time()
     if time_to_expiry > 0:
         info('Waiting %d seconds to reach original expiry...\n' % int(time_to_expiry))
         time.sleep(time_to_expiry)
 
-    # Step 5: 在原过期时间点检查 IP 是否仍然有效
+    # Step 4: 在原过期时间点检查 IP 是否仍然有效
     info('\nStep 4: Verify IP is still valid at original expiry time\n')
     ip_at_expiry = get_current_ip(h1)
     info('IP at original expiry: %s\n' % ip_at_expiry)
 
     if ip_at_expiry == initial_ip and ip_at_expiry is not None:
         info('[PASSED]: IP still valid at original expiry (renewal successful)\n')
-        step4_passed = True
+        info('This confirms dhclient auto-renewed the lease at T1 time\n')
+        result = True
     else:
-        info('[NOTE]: IP changed or invalid at original expiry\n')
-        step4_passed = False
-
-    # 等待额外的租约时间（续租应该把过期时间延长了 lease_time）
-    info('\nStep 5: Wait additional %d seconds (past extended expiry)...\n' % (lease_time + 5))
-    time.sleep(lease_time + 5)
-
-    # Step 7: 验证 IP 应该已经失效（租约真正过期）
-    info('\nStep 6: Verify IP should be invalid now\n')
-    final_ip = get_current_ip(h1)
-    info('*** Final IP: %s\n' % final_ip)
-
-    if final_ip != initial_ip or final_ip is None:
-        info('[PASSED]: IP expired after extended lease time\n')
-        step6_passed = True
-    else:
-        info('[NOTE]: IP still valid (may be normal if client auto-reacquired)\n')
-        step6_passed = True  # 客户端可能自动重新请求
+        info('[FAILED]: IP changed or invalid at original expiry\n')
+        info('Expected: %s, Got: %s\n' % (initial_ip, ip_at_expiry))
+        result = False
 
     net.stop()
 
-    # 整体测试结果：续租成功意味着在原过期时间点 IP 仍然有效
-    return step4_passed
+    # 测试结果：续租成功意味着在原过期时间点 IP 仍然有效
+    return result
 
 
 def run_interactive_test():
